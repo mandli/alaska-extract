@@ -45,22 +45,6 @@ ruff = "*"
 black = "*"
 pre-commit = "*"
 
-[feature.wrf.target.linux-64.dependencies]
-python = ">=3.11,<3.12"
-# xesmf currently constrains numpy < 2 via numba
-numpy = ">=1.26,<2"
-scipy = "*"
-xarray = "*"
-netcdf4 = ">=1.6"
-matplotlib = ">=3.8"
-xesmf = ">=0.8"
-esmpy = ">=8.4"
-esmf = ">=8.4"
-pytest = "*"
-ruff = "*"
-black = "*"
-pre-commit = "*"
-
 [tasks]
 check-wrf = "python -c \"import numpy; print('numpy', numpy.__version__)\""
 check-esmf = "python -c \"import esmpy, xesmf, numpy; print('esmpy', esmpy.__version__, '| xesmf', xesmf.__version__, '| numpy', numpy.__version__)\""
