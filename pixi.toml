@@ -1,0 +1,59 @@
+[workspace]
+name = "alaska-extract"
+version = "0.1.0"
+description = "Extract WRF U/V/P at z-level and optionally regrid to regular lat/lon."
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[environments]
+wrf = ["wrf"]
+regrid = ["regrid"]
+
+# --- WRF feature ---
+# On linux we keep the env solvable for CI by omitting wrf-python (it may still work on linux;
+# add it back if you want CI to test extraction too).
+[feature.wrf.target.osx-arm64.dependencies]
+python = ">=3.11,<3.12"
+wrf-python = ">=1.4.2,<2"
+numpy = ">=1.26"
+netcdf4 = ">=1.6"
+xarray = "*"
+matplotlib = ">=3.8"
+ffmpeg = "*"
+
+[feature.wrf.target.linux-64.dependencies]
+python = ">=3.11,<3.12"
+numpy = ">=1.26"
+netcdf4 = ">=1.6"
+xarray = "*"
+matplotlib = ">=3.8"
+
+# --- Regrid feature --- (contains linting and testing dependencies too)
+[feature.regrid.dependencies]
+python = ">=3.11,<3.12"
+# xesmf currently constrains numpy < 2 via numba
+numpy = ">=1.26,<2"
+scipy = "*"
+xarray = "*"
+netcdf4 = ">=1.6"
+matplotlib = ">=3.8"
+xesmf = ">=0.8"
+esmpy = ">=8.4"
+esmf = ">=8.4"
+pytest = "*"
+ruff = "*"
+black = "*"
+pre-commit = "*"
+
+[tasks]
+check-wrf = "python -c \"import numpy; print('numpy', numpy.__version__)\""
+check-esmf = "python -c \"import esmpy, xesmf, numpy; print('esmpy', esmpy.__version__, '| xesmf', xesmf.__version__, '| numpy', numpy.__version__)\""
+extract = "python wrf_extract_uvp_at_z.py"
+regrid  = "python wrf_regrid_uvp_to_latlon.py"
+test = "pytest"
+
+lint = "ruff check ."
+format = "ruff format ."
+format-check = "ruff format --check ."
+black = "black ."
+precommit-install = "pre-commit install"
