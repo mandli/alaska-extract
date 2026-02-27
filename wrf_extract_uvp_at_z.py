@@ -1,39 +1,38 @@
 #!/usr/bin/env python3
 """
-wrf_extract_uvp_at_z.py
-
-Concatenate a set of WRF NetCDF files and extract U/V winds + pressure at a target geometric height,
+Concatenate WRF NetCDF files and extract U/V winds + pressure at a target geometric height,
 then optionally make quick-look plots and ffmpeg movies.
 
-Outputs a compact NetCDF with the original full Time dimension:
-  - Times(Time, DateStrLen)  [bytes/char]
-  - XTIME(Time)              [minutes since simulation start, per WRF]
-  - U(Time, south_north, west_east)  [m s-1] at target z
-  - V(Time, south_north, west_east)  [m s-1] at target z
-  - P(Time, south_north, west_east)  [Pa] at target z
-Optional with --keep-geo:
-  - XLAT(south_north, west_east)  [deg_north]
-  - XLONG(south_north, west_east) [deg_east]
-  - HGT(south_north, west_east)   [m] terrain height
+Output file contains:
+  Times(Time, DateStrLen)
+  XTIME(Time)
+  U(Time, south_north, west_east)  [m/s] at target z
+  V(Time, south_north, west_east)  [m/s] at target z
+  P(Time, south_north, west_east)  [Pa ] at target z
+Optionally: XLAT, XLONG, HGT (static) via --keep-geo
 
-Notes on z-level selection:
-  - z-ref=msl uses WRF geopotential height (PH+PHB)/g
-  - z-ref=agl uses (PH+PHB)/g - HGT
-  - If requested z yields all-NaN (below terrain everywhere), the script can fall back to
-    z = zmin + dz (default dz=10m) unless --no-z-fallback is set.
-  - --z-auto forces z = zmin + dz per file.
+Plotting/Movie:
+  --plot with matplotlib quicklooks, --movie creates MP4 via ffmpeg
+  --plot-domain crops by indices (I0 I1 J0 J1)
+  --plot-bbox crops by lon/lat bounds (LON0 LON1 LAT0 LAT1) using XLONG/XLAT
 
-Input expansion:
-  - You can pass files, directories, or glob patterns. Directories are searched for *.nc.
-  - Default ordering is by filename. Use --sort time to sort by Times[0] from each file.
+Robustness:
+  - If requested z-level yields all-NaN from interplevel(), can fall back to
+    (zmin + dz) where zmin is the global minimum of the chosen z_field.
+  - Plotting masks NaNs to avoid colorbar failures over land/below-ground regions.
 
-Requires (wrf env):
-  numpy, netCDF4, wrf-python, xarray (optional), matplotlib (optional), ffmpeg (optional)
+Requires:
+  - numpy
+  - netCDF4
+  - wrf-python
+  - matplotlib (for plotting/movie frames)
+  - ffmpeg (optional, only for --movie)
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shutil
 import subprocess
@@ -43,12 +42,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 from netCDF4 import Dataset
-
-from wrf import getvar, interplevel
-
-from alaska_extract.common import decode_wrf_times, find_ffmpeg, vprint, lon_continuous_about
-from alaska_extract.version import VERSION
-from alaska_extract.plotting import FixedScale, compute_fixed_scale, plot_uvp_quicklook, movie_from_frames
+from wrf import ALL_TIMES, getvar, interplevel
 
 
 # -----------------------------
@@ -58,8 +52,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Extract U/V and pressure from WRF at a given z-level and concatenate over Time."
     )
-    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    p.add_argument("inputs", nargs="+", help="Input files/dirs/globs (e.g. h01_files/*.nc).")
+    p.add_argument("files", nargs="+", help="Input WRF NetCDF files, in time order.")
     p.add_argument("-o", "--output", required=True, help="Output NetCDF filename.")
     p.add_argument(
         "--force",
@@ -67,144 +60,127 @@ def parse_args() -> argparse.Namespace:
         help="Overwrite output file if it exists. If not set and output exists, extraction is skipped "
              "(but plot/movie can still run).",
     )
-    p.add_argument("--verbose", action="store_true", help="Verbose logging.")
-
-    p.add_argument("--sort", choices=["name", "time"], default="name",
-                   help="How to order expanded inputs. Default: name.")
-    p.add_argument("--glob", default="*.nc",
-                   help="When an input is a directory, glob pattern to collect files. Default: *.nc")
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Verbose logging (prints diagnostics like z-range and NaN fractions, plus extra details).",
+    )
 
     p.add_argument("--z", type=float, default=0.0, help="Target height in meters. Default: 0 (MSL).")
-    p.add_argument("--z-ref", choices=["msl", "agl"], default="msl",
-                   help="Interpret --z as mean sea level (msl) or above ground (agl). Default: msl.")
+    p.add_argument(
+        "--z-ref",
+        choices=["msl", "agl"],
+        default="msl",
+        help="Interpret --z as 'msl' (mean sea level) or 'agl' (above ground level). Default: msl.",
+    )
 
-    p.add_argument("--z-auto", action="store_true",
-                   help="Use z = zmin + dz per file (ignores --z).")
-    p.add_argument("--z-auto-dz", type=float, default=10.0,
-                   help="dz in meters for --z-auto or fallback. Default: 10.")
-    p.add_argument("--no-z-fallback", action="store_true",
-                   help="Disable fallback if interplevel returns all-NaN at requested z.")
+    # Robust z selection / fallback
+    p.add_argument(
+        "--z-auto",
+        action="store_true",
+        help="Ignore --z and instead use (zmin + dz) where zmin is the minimum of the chosen z_field "
+             "for each file. Use --z-auto-dz to set dz.",
+    )
+    p.add_argument(
+        "--z-auto-dz",
+        type=float,
+        default=10.0,
+        help="dz in meters for --z-auto or fallback. Default: 10.",
+    )
+    p.add_argument(
+        "--no-z-fallback",
+        action="store_true",
+        help="Disable automatic fallback if interplevel returns all-NaN at requested z.",
+    )
 
     p.add_argument("--compression", type=int, default=4, help="NetCDF deflate level (0-9). Default: 4.")
-
-    geo = p.add_mutually_exclusive_group()
-    geo.add_argument("--keep-geo", action="store_true", default=True,
-                     help="Write XLAT/XLONG/HGT to output (default: on).")
-    geo.add_argument("--no-keep-geo", dest="keep_geo", action="store_false",
-                     help="Do not store XLAT/XLONG/HGT in output.")
+    p.add_argument(
+        "--keep-geo",
+        action="store_true",
+        default=True,
+        help="Write XLAT/XLONG/HGT to output (recommended; required for --plot-bbox).",
+    )
 
     # Plotting
     p.add_argument("--plot", action="store_true", help="Generate a quick-look plot from the collated file.")
     p.add_argument("--plot-time", type=int, default=0, help="Time index to plot (0-based). Default: 0.")
-    p.add_argument("--plot-kind", choices=["speed", "pressure", "quiver", "both"], default="both")
-    p.add_argument("--plot-out", default=None, help="Output png filename. Default: derived from nc name.")
+    p.add_argument(
+        "--plot-kind",
+        choices=["speed", "pressure", "quiver", "both"],
+        default="speed",
+        help="What to plot. 'both' makes a 1x2 subplot (speed + pressure). Default: speed.",
+    )
+    p.add_argument("--plot-out", default=None, help="Output png filename. Default is derived from nc name.")
     p.add_argument("--plot-show", action="store_true", help="Show interactively instead of saving a PNG.")
     p.add_argument("--plot-step", type=int, default=1, help="Subsample every N grid points (>=1). Default: 1.")
-    p.add_argument("--plot-bbox", nargs=4, type=float, metavar=("LON0", "LON1", "LAT0", "LAT1"), default=None,
-                   help="Crop by lon/lat box (requires XLONG/XLAT).")
+    p.add_argument(
+        "--plot-domain",
+        nargs=4,
+        type=int,
+        metavar=("I0", "I1", "J0", "J1"),
+        default=None,
+        help="Crop by indices: I0 I1 J0 J1 (I=west_east, J=south_north), as Python slices [I0:I1], [J0:J1].",
+    )
+    p.add_argument(
+        "--plot-bbox",
+        nargs=4,
+        type=float,
+        metavar=("LON0", "LON1", "LAT0", "LAT1"),
+        default=None,
+        help="Crop by lon/lat box (requires XLONG/XLAT in output; use --keep-geo).",
+    )
 
     # Movies
-    p.add_argument("--movie", action="store_true", help="Make an MP4 movie via ffmpeg.")
-    p.add_argument("--movie-kind", choices=["speed", "pressure", "quiver", "both"], default="both")
-    p.add_argument("--movie-fps", type=int, default=10)
-    p.add_argument("--movie-every", type=int, default=1)
-    p.add_argument("--movie-out", default=None)
-    p.add_argument("--ffmpeg", default="ffmpeg")
-    p.add_argument("--keep-frames", action="store_true")
+    p.add_argument("--movie", action="store_true", help="Make an MP4 movie via ffmpeg from the collated output.")
+    p.add_argument(
+        "--movie-kind",
+        choices=["speed", "pressure", "quiver", "both"],
+        default="speed",
+        help="Field to animate. Default: speed.",
+    )
+    p.add_argument("--movie-fps", type=int, default=10, help="Movie FPS. Default: 10.")
+    p.add_argument("--movie-every", type=int, default=1, help="Use every Nth timestep (>=1). Default: 1.")
+    p.add_argument("--movie-out", default=None, help="Movie filename. Default: <base>_<kind>.mp4")
+    p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable (name or full path). Default: ffmpeg")
+    p.add_argument("--keep-frames", action="store_true", help="Keep intermediate PNG frames.")
 
-    # Movie scaling controls (anchored by default)
-    p.add_argument("--movie-fixed-scale", action="store_true", default=True,
-                   help="Use fixed color scale across frames (default: on).")
-    p.add_argument("--no-movie-fixed-scale", dest="movie_fixed_scale", action="store_false",
-                   help="Disable fixed scaling (per-frame autoscale).")
-    p.add_argument("--movie-scale", choices=["minmax", "percentile"], default="percentile")
-    p.add_argument("--movie-pmin", type=float, default=1.0)
-    p.add_argument("--movie-pmax", type=float, default=99.0)
+    # Movie scaling controls
+    p.add_argument(
+        "--movie-fixed-scale",
+        action="store_true",
+        default=True,
+        help="Use fixed color scale across frames (default: on).",
+    )
+    p.add_argument(
+        "--no-movie-fixed-scale",
+        dest="movie_fixed_scale",
+        action="store_false",
+        help="Disable fixed movie scaling (per-frame autoscale; may flicker).",
+    )
+    p.add_argument(
+        "--movie-scale",
+        choices=["minmax", "percentile"],
+        default="minmax",
+        help="How to compute fixed scaling. Default: minmax.",
+    )
+    p.add_argument("--movie-pmin", type=float, default=1.0, help="Lower percentile for percentile scaling. Default: 1.")
+    p.add_argument("--movie-pmax", type=float, default=99.0, help="Upper percentile for percentile scaling. Default: 99.")
 
     return p.parse_args()
 
 
 # -----------------------------
-# Input expansion + sorting
+# Helpers
 # -----------------------------
-def _has_wildcards(s: str) -> bool:
-    return any(ch in s for ch in ["*", "?", "["])
+def _ensure_same_hgrid(nc: Dataset, sn: int, we: int) -> None:
+    if nc.dimensions["south_north"].size != sn or nc.dimensions["west_east"].size != we:
+        raise ValueError(
+            f"Horizontal grid mismatch: expected (south_north={sn}, west_east={we}) "
+            f"got ({nc.dimensions['south_north'].size}, {nc.dimensions['west_east'].size})"
+        )
 
 
-def expand_inputs(inputs: List[str], dir_glob: str, verbose: bool) -> List[Path]:
-    out: List[Path] = []
-    for token in inputs:
-        p = Path(token).expanduser()
-        # explicit wildcards
-        if _has_wildcards(token):
-            parent = p.parent if str(p.parent) != "" else Path(".")
-            pattern = p.name
-            matches = sorted(parent.glob(pattern))
-            out.extend([m for m in matches if m.is_file()])
-            continue
-
-        if p.is_dir():
-            matches = sorted(p.glob(dir_glob))
-            out.extend([m for m in matches if m.is_file()])
-        elif p.is_file():
-            out.append(p)
-        else:
-            raise FileNotFoundError(f"Input not found: {token}")
-
-    # de-duplicate while preserving order
-    seen = set()
-    uniq: List[Path] = []
-    for f in out:
-        key = str(f.resolve())
-        if key not in seen:
-            uniq.append(f)
-            seen.add(key)
-
-    vprint(verbose, f"[inputs] expanded to {len(uniq)} files")
-    return uniq
-
-
-def _first_timestr(path: Path) -> str:
-    with Dataset(path, "r") as nc:
-        if "Times" not in nc.variables:
-            return ""
-        v = nc.variables["Times"][0, :]
-        return decode_wrf_times(v.tobytes())
-
-
-def sort_inputs(files: List[Path], how: str, verbose: bool) -> List[Path]:
-    if how == "name":
-        return sorted(files, key=lambda p: str(p))
-    # time sort
-    pairs = [(f, _first_timestr(f)) for f in files]
-    if verbose:
-        for f, t in pairs[:5]:
-            print(f"[sort] {t}  {f}")
-    return [f for f, _ in sorted(pairs, key=lambda x: x[1])]
-
-
-# -----------------------------
-# Core extraction
-# -----------------------------
-def _z_field(nc: Dataset, z_ref: str):
-    """Return z field (Time, bottom_top_stag, sn, we) as a wrf-python variable."""
-    ph = getvar(nc, "PH", timeidx=None)
-    phb = getvar(nc, "PHB", timeidx=None)
-    g = 9.81
-    z = (ph + phb) / g  # geopotential height (m, MSL) on stag levels
-    if z_ref == "agl":
-        hgt = getvar(nc, "HGT", timeidx=0)
-        z = z - hgt
-    return z
-
-
-def _interp_at_z(nc: Dataset, varname: str, z: float, zref: str):
-    zf = _z_field(nc, zref)
-    v = getvar(nc, varname, timeidx=None)
-    return interplevel(v, zf, z)
-
-
-def _read_static_geo(nc: Dataset):
+def _get_static_fields(nc: Dataset) -> dict:
     out = {}
     if "XLAT" in nc.variables:
         out["XLAT"] = nc.variables["XLAT"][0, :, :].astype("f4")
@@ -216,365 +192,797 @@ def _read_static_geo(nc: Dataset):
     return out
 
 
-def extract(files: List[Path], out_nc: Path, *, z: float, zref: str, z_auto: bool, dz: float,
-            no_fallback: bool, keep_geo: bool, compression: int, verbose: bool) -> None:
-    # Inspect first file for dimensions
-    with Dataset(files[0], "r") as nc0:
-        sn = nc0.dimensions["south_north"].size
-        we = nc0.dimensions["west_east"].size
-        datestrlen = nc0.dimensions["DateStrLen"].size if "DateStrLen" in nc0.dimensions else 19
+def _read_timestr(nc: Dataset, t_index: int) -> str:
+    if "Times" not in nc.variables:
+        return f"t={t_index}"
+    ts = nc.variables["Times"][t_index, :].tobytes().decode("utf-8", errors="ignore").strip()
+    return ts if ts else f"t={t_index}"
 
-        static = _read_static_geo(nc0) if keep_geo else {}
 
-    # Gather time counts
-    counts = []
-    for f in files:
-        with Dataset(f, "r") as nc:
-            if nc.dimensions["south_north"].size != sn or nc.dimensions["west_east"].size != we:
-                raise ValueError(f"Grid mismatch in {f}")
-            counts.append(nc.dimensions["Time"].size)
-    nt = int(sum(counts))
-    vprint(verbose, f"[extract] total Time={nt} from {len(files)} files")
+def _get_xy(nc: Dataset) -> Tuple[np.ndarray, np.ndarray, str, str]:
+    has_geo = ("XLAT" in nc.variables) and ("XLONG" in nc.variables)
+    if has_geo:
+        lat = np.asarray(nc.variables["XLAT"][:, :], dtype=np.float64)
+        lon = np.asarray(nc.variables["XLONG"][:, :], dtype=np.float64)
 
-    # Prepare output
-    out_nc.parent.mkdir(parents=True, exist_ok=True)
-    if out_nc.exists():
-        out_nc.unlink()
+        # Unwrap longitude to avoid antimeridian artifacts in pcolormesh
+        lon_u = _unwrap_lon(lon)
 
-    with Dataset(out_nc, "w", format="NETCDF4") as out:
-        out.createDimension("Time", nt)
-        out.createDimension("south_north", sn)
-        out.createDimension("west_east", we)
-        out.createDimension("DateStrLen", datestrlen)
+        return lon_u, lat, "Longitude (unwrapped)", "Latitude"
 
-        Times = out.createVariable("Times", "S1", ("Time", "DateStrLen"))
-        XTIME = out.createVariable("XTIME", "f8", ("Time",))
-        Uo = out.createVariable("U", "f4", ("Time", "south_north", "west_east"),
-                                zlib=True, complevel=compression)
-        Vo = out.createVariable("V", "f4", ("Time", "south_north", "west_east"),
-                                zlib=True, complevel=compression)
-        Po = out.createVariable("P", "f4", ("Time", "south_north", "west_east"),
-                                zlib=True, complevel=compression)
+    we = nc.dimensions["west_east"].size
+    sn = nc.dimensions["south_north"].size
+    x = np.arange(we)[None, :].repeat(sn, axis=0)
+    y = np.arange(sn)[:, None].repeat(we, axis=1)
+    return x, y, "west_east index", "south_north index"
 
-        Uo.units = "m s-1"
-        Vo.units = "m s-1"
-        Po.units = "Pa"
 
-        if keep_geo and static:
-            out.createVariable("XLAT", "f4", ("south_north", "west_east"))[:] = static["XLAT"]
-            out["XLAT"].units = "degrees_north"
-            out.createVariable("XLONG", "f4", ("south_north", "west_east"))[:] = static["XLONG"]
-            out["XLONG"].units = "degrees_east"
-            if "HGT" in static:
-                out.createVariable("HGT", "f4", ("south_north", "west_east"))[:] = static["HGT"]
-                out["HGT"].units = "m"
+def _domain_slices_from_indices(
+    nc: Dataset,
+    plot_domain: Optional[List[int]],
+    plot_step: int,
+) -> Tuple[slice, slice]:
+    """Return (south_north slice, west_east slice)."""
+    if plot_step < 1:
+        raise ValueError("--plot-step must be >= 1")
 
-        # Copy global attrs from first file
-        with Dataset(files[0], "r") as nc0:
-            for k in nc0.ncattrs():
-                try:
-                    out.setncattr(k, nc0.getncattr(k))
-                except Exception:
-                    pass
+    sn = nc.dimensions["south_north"].size
+    we = nc.dimensions["west_east"].size
 
-        out.setncattr("extract_z_m", float(z))
-        out.setncattr("extract_z_ref", str(zref))
-        out.setncattr("extract_z_auto", int(bool(z_auto)))
-        out.setncattr("extract_z_auto_dz_m", float(dz))
+    if plot_domain is None:
+        return slice(0, sn, plot_step), slice(0, we, plot_step)
 
-        t0 = 0
-        for f in files:
-            with Dataset(f, "r") as nc:
-                nT = nc.dimensions["Time"].size
-                # Times and XTIME
-                if "Times" in nc.variables:
-                    Times[t0:t0+nT, :] = nc.variables["Times"][:, :]
-                if "XTIME" in nc.variables:
-                    XTIME[t0:t0+nT] = nc.variables["XTIME"][:]
-                else:
-                    XTIME[t0:t0+nT] = np.arange(nT, dtype=np.float64)
+    i0, i1, j0, j1 = plot_domain
+    if not (0 <= i0 <= we and 0 <= i1 <= we and 0 <= j0 <= sn and 0 <= j1 <= sn):
+        raise ValueError(
+            f"--plot-domain out of bounds for grid (west_east={we}, south_north={sn}). "
+            f"Got I0,I1,J0,J1 = {i0},{i1},{j0},{j1}"
+        )
+    if i1 <= i0 or j1 <= j0:
+        raise ValueError(f"--plot-domain must have I1>I0 and J1>J0. Got {i0},{i1},{j0},{j1}")
 
-                # choose z per file if needed
-                z_use = float(z)
-                if z_auto:
-                    zf = _z_field(nc, zref)
-                    zmin = float(np.nanmin(zf.values))
-                    z_use = zmin + float(dz)
-                ua = _interp_at_z(nc, "ua", z_use, zref)
-                va = _interp_at_z(nc, "va", z_use, zref)
-                p = _interp_at_z(nc, "p", z_use, zref)  # Pa
+    return slice(j0, j1, plot_step), slice(i0, i1, plot_step)
 
-                # fallback if all NaN
-                if (not no_fallback) and (np.isnan(ua.values).all() or np.isnan(va.values).all() or np.isnan(p.values).all()):
-                    zf = _z_field(nc, zref)
-                    zmin = float(np.nanmin(zf.values))
-                    z_fb = zmin + float(dz)
-                    vprint(verbose, f"[{f.name}] all-NaN at z={z_use:.2f}, fallback z={z_fb:.2f}")
-                    ua = _interp_at_z(nc, "ua", z_fb, zref)
-                    va = _interp_at_z(nc, "va", z_fb, zref)
-                    p = _interp_at_z(nc, "p", z_fb, zref)
 
-                if verbose:
-                    zf = _z_field(nc, zref)
-                    zmin, zmax = float(np.nanmin(zf.values)), float(np.nanmax(zf.values))
-                    nan_u = float(np.mean(~np.isfinite(ua.values)))
-                    nan_v = float(np.mean(~np.isfinite(va.values)))
-                    nan_p = float(np.mean(~np.isfinite(p.values)))
-                    print(f"[{f.name}] z_field range: {zmin:.2f} .. {zmax:.2f} m ({zref}), target={z_use:.2f}")
-                    print(f"  NaN frac ua_z={nan_u:.3f}, va_z={nan_v:.3f}, p_z={nan_p:.3f}")
+def _bbox_to_index_domain(nc: Dataset, bbox: List[float]) -> List[int]:
+    """
+    Convert lon/lat bbox to an index-domain [I0,I1,J0,J1] that covers the bbox.
 
-                Uo[t0:t0+nT, :, :] = ua.values.astype("f4")
-                Vo[t0:t0+nT, :, :] = va.values.astype("f4")
-                Po[t0:t0+nT, :, :] = p.values.astype("f4")
+    bbox: [lon0, lon1, lat0, lat1]
+    Requires XLONG/XLAT in the collated file.
 
-                t0 += nT
+    Dateline handling:
+      - We do bbox logic in [0,360) space.
+      - If lon0_360 <= lon1_360: standard range.
+      - If lon0_360 > lon1_360: interpret as crossing the dateline, i.e.
+            lon in [lon0_360, 360) OR lon in [0, lon1_360].
 
+    Note: This assumes your bbox does not intend to select "the long way around" the globe.
+    """
+    if "XLAT" not in nc.variables or "XLONG" not in nc.variables:
+        raise KeyError("XLAT/XLONG not found; --plot-bbox requires --keep-geo when creating output.")
+
+    lon0, lon1, lat0, lat1 = bbox
+    la = min(lat0, lat1)
+    lb = max(lat0, lat1)
+
+    lat = np.asarray(nc.variables["XLAT"][:, :], dtype=np.float64)
+    lon = np.asarray(nc.variables["XLONG"][:, :], dtype=np.float64)
+
+    lon360 = _lon_to_360(lon)
+    lon0_360 = float(_lon_to_360(lon0))
+    lon1_360 = float(_lon_to_360(lon1))
+
+    lat_mask = (lat >= la) & (lat <= lb)
+
+    if lon0_360 <= lon1_360:
+        lon_mask = (lon360 >= lon0_360) & (lon360 <= lon1_360)
+    else:
+        # crosses dateline
+        lon_mask = (lon360 >= lon0_360) | (lon360 <= lon1_360)
+
+    mask = lat_mask & lon_mask
+
+    if not np.any(mask):
+        raise ValueError(
+            "No grid points found inside --plot-bbox; check bounds and lon convention. "
+            f"(Interpreted lon in [0,360): lon0={lon0_360:.2f}, lon1={lon1_360:.2f}, "
+            f"lat=[{la:.2f},{lb:.2f}])"
+        )
+
+    jj, ii = np.where(mask)
+    j0 = int(jj.min())
+    j1 = int(jj.max()) + 1
+    i0 = int(ii.min())
+    i1 = int(ii.max()) + 1
+    return [i0, i1, j0, j1]
+
+
+def _resolve_plot_domain(
+    nc: Dataset,
+    plot_domain: Optional[List[int]],
+    plot_bbox: Optional[List[float]],
+) -> Optional[List[int]]:
+    if plot_domain is not None and plot_bbox is not None:
+        raise ValueError("Use only one of --plot-domain or --plot-bbox (not both).")
+    if plot_bbox is not None:
+        return _bbox_to_index_domain(nc, plot_bbox)
+    return plot_domain
+
+
+def _nan_frac(a: np.ndarray) -> float:
+    aa = np.asarray(a)
+    if aa.size == 0:
+        return float("nan")
+    return float(np.isnan(aa).mean())
+
+
+
+def _interplevel_timewise(field, z_field, z_target):
+    """Apply wrf.interplevel in a time-safe way.
+
+    wrf-python's interplevel() can be strict about shape matching and can raise:
+        ValueError: arguments 0 and 1 must have the same shape
+    when handed 4D inputs that don't align exactly (e.g., time-dependent z_field
+    handling, or unexpected squeezing).
+
+    This helper forces 3D-per-time interpolation for 4D inputs and then stacks.
+    """
+    from wrf import interplevel  # local import keeps module import light
+
+    field_ndim = getattr(field, "ndim", np.asarray(field).ndim)
+    z_ndim = getattr(z_field, "ndim", np.asarray(z_field).ndim)
+
+    # 3D case: just do it
+    if field_ndim == 3:
+        return np.asarray(interplevel(field, z_field, z_target))
+
+    if field_ndim != 4:
+        raise ValueError(f"Expected field to be 3D or 4D, got ndim={field_ndim}")
+
+    nt = field.shape[0]
+    out = []
+    for t in range(nt):
+        f3 = field.isel(Time=t) if hasattr(field, "isel") else field[t, ...]
+        if z_ndim == 4:
+            z3 = z_field.isel(Time=t) if hasattr(z_field, "isel") else z_field[t, ...]
+        else:
+            z3 = z_field
+        out.append(np.asarray(interplevel(f3, z3, z_target)))
+
+    return np.stack(out, axis=0)
+
+def _unwrap_lon(lon_deg: np.ndarray) -> np.ndarray:
+    """Unwrap longitude along west_east so there is no antimeridian jump (for plotting)."""
+    lon = np.asarray(lon_deg, dtype=np.float64)
+    return np.rad2deg(np.unwrap(np.deg2rad(lon), axis=1))
+
+
+def _lon_to_360(lon_deg: np.ndarray) -> np.ndarray:
+    """Convert longitude(s) to [0, 360) for robust bbox masking."""
+    lon = np.asarray(lon_deg, dtype=np.float64)
+    return np.mod(lon, 360.0)
 
 # -----------------------------
-# Plot/movie helpers (quicklook only; lat/lon plots prefer regrid script)
+# Plotting
 # -----------------------------
-def _decode_time_for_title(ds, t_index: int) -> str:
-    if "Times" not in ds.variables:
-        return ""
-    v = ds["Times"][t_index, :]
-    try:
-        return decode_wrf_times(v.tobytes())
-    except Exception:
-        return decode_wrf_times(v)
-
-
-def _plot_quicklook(
-    ds,
-    t_index: int,
+def quicklook_plot(
+    nc_path: str,
     kind: str,
+    t_index: int,
     out_png: Optional[str],
     show: bool,
-    step: int,
-    bbox: Optional[Tuple[float, float, float, float]],
-    *,
-    fixed_scale: bool = False,
-    scale_speed: Optional["FixedScale"] = None,
-    scale_pressure: Optional["FixedScale"] = None,
+    plot_step: int = 1,
+    plot_domain: Optional[List[int]] = None,
+    plot_bbox: Optional[List[float]] = None,
+    speed_vmin: Optional[float] = None,
+    speed_vmax: Optional[float] = None,
+    pres_vmin: Optional[float] = None,
+    pres_vmax: Optional[float] = None,
 ) -> None:
-    """
-    Thin wrapper around alaska_extract.plotting.plot_uvp_quicklook.
+    if not show:
+        import matplotlib
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    Handles:
-      - lon "continuous" unwrap for Alaska/Pacific
-      - optional bbox cropping on lon/lat
-      - downsampling via `step`
-    """
-    # Pull fields
-    U = np.asarray(ds["U"][t_index, :, :], dtype=np.float64)
-    V = np.asarray(ds["V"][t_index, :, :], dtype=np.float64)
-    P = np.asarray(ds["P"][t_index, :, :], dtype=np.float64)
+    with Dataset(nc_path) as nc:
+        nt = nc.dimensions["Time"].size
+        if t_index < 0 or t_index >= nt:
+            raise IndexError(f"--plot-time {t_index} out of range (Time size = {nt})")
 
-    # x/y: prefer lon/lat if present
-    if "XLAT" in ds.variables and "XLONG" in ds.variables:
-        lat = np.asarray(ds["XLAT"][:, :], dtype=np.float64)
-        lon = np.asarray(ds["XLONG"][:, :], dtype=np.float64)
-        lon = lon_continuous_about(lon)  # continuous for Alaska/Pacific
-        X, Y = lon, lat
-        if bbox is not None:
-            lon0, lon1, lat0, lat1 = bbox
-            m = (X >= lon0) & (X <= lon1) & (Y >= lat0) & (Y <= lat1)
-            if np.any(m):
-                jj, ii = np.where(m)
-                j0, j1 = int(jj.min()), int(jj.max()) + 1
-                i0, i1 = int(ii.min()), int(ii.max()) + 1
-                X = X[j0:j1, i0:i1]
-                Y = Y[j0:j1, i0:i1]
-                U = U[j0:j1, i0:i1]
-                V = V[j0:j1, i0:i1]
-                P = P[j0:j1, i0:i1]
-    else:
-        X, Y = np.meshgrid(np.arange(U.shape[1]), np.arange(U.shape[0]))
+        resolved_domain = _resolve_plot_domain(nc, plot_domain, plot_bbox)
 
-    # downsample
-    step = max(1, int(step))
-    X = X[::step, ::step]
-    Y = Y[::step, ::step]
-    U = U[::step, ::step]
-    V = V[::step, ::step]
-    P = P[::step, ::step]
+        x, y, xlabel, ylabel = _get_xy(nc)
+        jsl, isl = _domain_slices_from_indices(nc, resolved_domain, plot_step)
 
-    title_time = _decode_time_for_title(ds, t_index)
-    plot_uvp_quicklook(
-        X,
-        Y,
-        U,
-        V,
-        P,
-        title=title_time,
-        kind=kind,
-        out_png=out_png,
-        show=show,
-        fixed_scale=fixed_scale,
-        scale_speed=scale_speed,
-        scale_pressure=scale_pressure,
-    )
+        xs = x[jsl, isl]
+        ys = y[jsl, isl]
+
+        u = nc.variables["U"][t_index, :, :][jsl, isl]
+        v = nc.variables["V"][t_index, :, :][jsl, isl]
+        p = nc.variables["P"][t_index, :, :][jsl, isl]
+
+        timestr = _read_timestr(nc, t_index)
+
+        # Mask invalids for stable plotting (NaNs over land/below-ground)
+        u = np.ma.masked_invalid(u)
+        v = np.ma.masked_invalid(v)
+        p = np.ma.masked_invalid(p)
+
+        if kind == "both":
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
+
+            spd = np.sqrt(u * u + v * v)
+            spd = np.ma.masked_invalid(spd)
+
+            if spd.mask.all():
+                raise ValueError("Wind speed field is all-NaN/masked in requested plot region/time.")
+            if p.mask.all():
+                raise ValueError("Pressure field is all-NaN/masked in requested plot region/time.")
+
+            m0 = axes[0].pcolormesh(xs, ys, spd, shading="auto", vmin=speed_vmin, vmax=speed_vmax)
+            fig.colorbar(m0, ax=axes[0]).set_label("Wind speed (m/s)")
+            axes[0].set_title("Wind speed")
+
+            m1 = axes[1].pcolormesh(xs, ys, p, shading="auto", vmin=pres_vmin, vmax=pres_vmax)
+            fig.colorbar(m1, ax=axes[1]).set_label("Pressure (Pa)")
+            axes[1].set_title("Pressure")
+
+            for ax in axes:
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+
+            fig.suptitle(timestr)
+
+        else:
+            fig, ax = plt.subplots(figsize=(10, 7), constrained_layout=True)
+
+            if kind == "speed":
+                spd = np.sqrt(u * u + v * v)
+                spd = np.ma.masked_invalid(spd)
+                if spd.mask.all():
+                    raise ValueError("Wind speed field is all-NaN/masked in requested plot region/time.")
+                m = ax.pcolormesh(xs, ys, spd, shading="auto", vmin=speed_vmin, vmax=speed_vmax)
+                fig.colorbar(m, ax=ax).set_label("Wind speed (m/s)")
+                ax.set_title(f"Wind speed ({timestr})")
+
+            elif kind == "pressure":
+                if p.mask.all():
+                    raise ValueError("Pressure field is all-NaN/masked in requested plot region/time.")
+                m = ax.pcolormesh(xs, ys, p, shading="auto", vmin=pres_vmin, vmax=pres_vmax)
+                fig.colorbar(m, ax=ax).set_label("Pressure (Pa)")
+                ax.set_title(f"Pressure ({timestr})")
+
+            elif kind == "quiver":
+                spd = np.sqrt(u * u + v * v)
+                spd = np.ma.masked_invalid(spd)
+                if spd.mask.all():
+                    raise ValueError("Wind speed field is all-NaN/masked in requested plot region/time.")
+                m = ax.pcolormesh(xs, ys, spd, shading="auto", vmin=speed_vmin, vmax=speed_vmax)
+                fig.colorbar(m, ax=ax).set_label("Wind speed (m/s)")
+
+                sn2, we2 = u.shape
+                step_y = max(1, sn2 // 40)
+                step_x = max(1, we2 // 40)
+
+                ax.quiver(
+                    xs[::step_y, ::step_x],
+                    ys[::step_y, ::step_x],
+                    u[::step_y, ::step_x],
+                    v[::step_y, ::step_x],
+                    angles="xy",
+                    scale_units="xy",
+                )
+                ax.set_title(f"Wind vectors ({timestr})")
+
+            else:
+                raise ValueError(f"Unknown plot kind: {kind}")
+
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+
+        if show:
+            plt.show()
+        else:
+            if out_png is None:
+                base = os.path.splitext(os.path.basename(nc_path))[0]
+                out_png = f"{base}_{kind}_t{t_index:04d}.png"
+            fig.savefig(out_png, dpi=150)
+            plt.close(fig)
+            print(f"Wrote plot: {out_png}")
 
 
-def _compute_movie_scales(
-    ds,
-    *,
-    fixed_scale: bool,
+# -----------------------------
+# Movie scaling + ffmpeg
+# -----------------------------
+def _compute_movie_limits(
+    nc_path: str,
+    kind: str,
+    every: int,
+    plot_step: int,
+    plot_domain: Optional[List[int]],
+    plot_bbox: Optional[List[float]],
     scale_mode: str,
     pmin: float,
     pmax: float,
-) -> Tuple[Optional[FixedScale], Optional[FixedScale]]:
-    """
-    Compute anchored scales for movies. Returns (speed_scale, pressure_scale).
-    """
-    if not fixed_scale:
-        return None, None
-    U = np.asarray(ds["U"][:], dtype=np.float64)
-    V = np.asarray(ds["V"][:], dtype=np.float64)
-    P = np.asarray(ds["P"][:], dtype=np.float64)
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    if every < 1:
+        raise ValueError("--movie-every must be >= 1")
+    if plot_step < 1:
+        raise ValueError("--plot-step must be >= 1")
 
-    spd = np.sqrt(U * U + V * V)
-    sc_spd = compute_fixed_scale(spd, mode=("minmax" if scale_mode == "minmax" else "percentile"),
-                                 pmin=float(pmin), pmax=float(pmax))
-    sc_p = compute_fixed_scale(P, mode=("minmax" if scale_mode == "minmax" else "percentile"),
-                               pmin=float(pmin), pmax=float(pmax))
-    return sc_spd, sc_p
+    with Dataset(nc_path) as nc:
+        nt = nc.dimensions["Time"].size
+        resolved_domain = _resolve_plot_domain(nc, plot_domain, plot_bbox)
+        jsl, isl = _domain_slices_from_indices(nc, resolved_domain, plot_step)
+
+    need_speed = kind in ("speed", "quiver", "both")
+    need_pres = kind in ("pressure", "both")
+
+    if scale_mode == "minmax":
+        spd_min = math.inf
+        spd_max = -math.inf
+        p_min = math.inf
+        p_max = -math.inf
+
+        with Dataset(nc_path) as nc:
+            U = nc.variables["U"]
+            V = nc.variables["V"]
+            P = nc.variables["P"]
+
+            for t in range(0, nt, every):
+                if need_speed:
+                    u = U[t, :, :][jsl, isl]
+                    v = V[t, :, :][jsl, isl]
+                    spd = np.sqrt(u * u + v * v)
+                    # ignore NaNs
+                    if not np.isnan(spd).all():
+                        spd_min = min(spd_min, float(np.nanmin(spd)))
+                        spd_max = max(spd_max, float(np.nanmax(spd)))
+
+                if need_pres:
+                    pp = P[t, :, :][jsl, isl]
+                    if not np.isnan(pp).all():
+                        p_min = min(p_min, float(np.nanmin(pp)))
+                        p_max = max(p_max, float(np.nanmax(pp)))
+
+        speed_vmin = (spd_min if need_speed and spd_min != math.inf else None)
+        speed_vmax = (spd_max if need_speed and spd_max != -math.inf else None)
+        pres_vmin = (p_min if need_pres and p_min != math.inf else None)
+        pres_vmax = (p_max if need_pres and p_max != -math.inf else None)
+        return speed_vmin, speed_vmax, pres_vmin, pres_vmax
+
+    if scale_mode == "percentile":
+        if not (0.0 <= pmin < pmax <= 100.0):
+            raise ValueError("--movie-pmin/--movie-pmax must satisfy 0 <= pmin < pmax <= 100")
+
+        speed_samples: List[np.ndarray] = []
+        pres_samples: List[np.ndarray] = []
+
+        with Dataset(nc_path) as nc:
+            U = nc.variables["U"]
+            V = nc.variables["V"]
+            P = nc.variables["P"]
+
+            for t in range(0, nt, every):
+                if need_speed:
+                    u = U[t, :, :][jsl, isl]
+                    v = V[t, :, :][jsl, isl]
+                    spd = np.sqrt(u * u + v * v)
+                    spd = spd.astype(np.float32, copy=False)
+                    spd = spd[np.isfinite(spd)]
+                    if spd.size:
+                        speed_samples.append(spd)
+
+                if need_pres:
+                    pp = P[t, :, :][jsl, isl].astype(np.float32, copy=False)
+                    pp = pp[np.isfinite(pp)]
+                    if pp.size:
+                        pres_samples.append(pp)
+
+        speed_vmin = speed_vmax = None
+        pres_vmin = pres_vmax = None
+
+        if need_speed and speed_samples:
+            all_spd = np.concatenate(speed_samples)
+            speed_vmin = float(np.nanpercentile(all_spd, pmin))
+            speed_vmax = float(np.nanpercentile(all_spd, pmax))
+
+        if need_pres and pres_samples:
+            all_p = np.concatenate(pres_samples)
+            pres_vmin = float(np.nanpercentile(all_p, pmin))
+            pres_vmax = float(np.nanpercentile(all_p, pmax))
+
+        return speed_vmin, speed_vmax, pres_vmin, pres_vmax
+
+    raise ValueError(f"Unknown scale mode: {scale_mode}")
 
 
 def make_movie(
-    nc_path: Path,
+    nc_path: str,
     kind: str,
     fps: int,
     every: int,
     out_mp4: Optional[str],
-    ffmpeg: str,
+    ffmpeg_exe: str,
     keep_frames: bool,
-    fixed_scale: bool,
-    scale_mode: str,
-    pmin: float,
-    pmax: float,
     verbose: bool,
-    step: int,
-    bbox: Optional[Tuple[float, float, float, float]],
+    plot_step: int = 1,
+    plot_domain: Optional[List[int]] = None,
+    plot_bbox: Optional[List[float]] = None,
+    fixed_scale: bool = True,
+    scale_mode: str = "minmax",
+    pmin: float = 1.0,
+    pmax: float = 99.0,
 ) -> None:
-    """
-    Render a simple MP4 movie from the extracted file.
+    if every < 1:
+        raise ValueError("--movie-every must be >= 1")
+    if fps < 1:
+        raise ValueError("--movie-fps must be >= 1")
+    if plot_step < 1:
+        raise ValueError("--plot-step must be >= 1")
 
-    Notes:
-      - Uses anchored color scales by default (see --movie-fixed-scale).
-      - Opens the dataset once (xarray) for speed and consistency.
-    """
-    base = nc_path.with_suffix("")
+    if shutil.which(ffmpeg_exe) is None and not Path(ffmpeg_exe).exists():
+        raise FileNotFoundError(f"ffmpeg not found: {ffmpeg_exe}")
+
+    with Dataset(nc_path) as nc:
+        nt = nc.dimensions["Time"].size
+
+    base = os.path.splitext(os.path.basename(nc_path))[0]
     if out_mp4 is None:
-        out_mp4 = str(base) + f".{kind}.mp4"
+        out_mp4 = f"{base}_{kind}.mp4"
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="uvp_frames_"))
-    try:
-        import xarray as xr
-        ds = xr.open_dataset(nc_path)
-        nt = int(ds.sizes.get("Time", 1))
-        every = max(1, int(every))
+    speed_vmin = speed_vmax = None
+    pres_vmin = pres_vmax = None
 
-        sc_spd, sc_p = _compute_movie_scales(
-            ds, fixed_scale=bool(fixed_scale), scale_mode=str(scale_mode), pmin=float(pmin), pmax=float(pmax)
+    if fixed_scale and kind in ("speed", "pressure", "quiver", "both"):
+        speed_vmin, speed_vmax, pres_vmin, pres_vmax = _compute_movie_limits(
+            nc_path=nc_path,
+            kind=kind,
+            every=every,
+            plot_step=plot_step,
+            plot_domain=plot_domain,
+            plot_bbox=plot_bbox,
+            scale_mode=scale_mode,
+            pmin=pmin,
+            pmax=pmax,
         )
-        if fixed_scale and sc_spd is not None and sc_p is not None:
-            vprint(verbose, f"[movie] speed scale: {sc_spd.vmin:.3g} .. {sc_spd.vmax:.3g}")
-            vprint(verbose, f"[movie] press scale: {sc_p.vmin:.3g} .. {sc_p.vmax:.3g}")
-
-        frame = 0
-        for t in range(0, nt, every):
-            png = tmpdir / f"frame_{frame:05d}.png"
-            _plot_quicklook(
-                ds,
-                t,
-                kind,
-                str(png),
-                False,
-                step,
-                bbox,
-                fixed_scale=bool(fixed_scale),
-                scale_speed=sc_spd,
-                scale_pressure=sc_p,
+        if verbose:
+            print(
+                "Movie fixed scale:",
+                f"speed=({speed_vmin}, {speed_vmax})",
+                f"pressure=({pres_vmin}, {pres_vmax})",
+                f"mode={scale_mode}",
             )
-            frame += 1
 
-        ds.close()
-        movie_from_frames(tmpdir, Path(out_mp4), fps=int(fps), ffmpeg=ffmpeg, verbose=bool(verbose),
-                          keep_frames=bool(keep_frames))
+    tmpdir = Path(tempfile.mkdtemp(prefix="wrf_frames_"))
+    pattern = tmpdir / "frame_%06d.png"
 
-        if keep_frames:
-            keep = Path(str(base) + f"_{kind}_frames")
-            if keep.exists():
-                shutil.rmtree(keep)
-            shutil.copytree(tmpdir, keep)
-            print(f"Kept frames: {keep}")
+    # Render frames
+    frame_idx = 0
+    for t in range(0, nt, every):
+        if (frame_idx % 10 == 0) or (t == 0) or (t + every >= nt):
+            print(f"Rendering frame {frame_idx+1} / {((nt-1)//every)+1} (t={t})")
 
-    finally:
-        if not keep_frames:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+        frame_file = tmpdir / f"frame_{frame_idx:06d}.png"
+        quicklook_plot(
+            nc_path,
+            kind,
+            t,
+            out_png=str(frame_file),
+            show=False,
+            plot_step=plot_step,
+            plot_domain=plot_domain,
+            plot_bbox=plot_bbox,
+            speed_vmin=speed_vmin,
+            speed_vmax=speed_vmax,
+            pres_vmin=pres_vmin,
+            pres_vmax=pres_vmax,
+        )
+        frame_idx += 1
+
+    # Encode with ffmpeg
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-framerate",
+        str(fps),
+        "-i",
+        str(pattern),
+        "-pix_fmt",
+        "yuv420p",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        str(out_mp4),
+    ]
+    if verbose:
+        print("Running:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    print(f"Wrote movie: {out_mp4}")
+
+    if not keep_frames:
+        for p in tmpdir.glob("frame_*.png"):
+            p.unlink()
+        tmpdir.rmdir()
+    else:
+        print(f"Kept frames in: {tmpdir}")
 
 
+# -----------------------------
+# Extraction
+# -----------------------------
+def _choose_target_z(
+    z_field: np.ndarray,
+    requested_z: float,
+    z_auto: bool,
+    dz: float,
+) -> float:
+    zmin = float(np.nanmin(np.asarray(z_field)))
+    if z_auto:
+        return zmin + dz
+    return requested_z
+
+
+def _interplevel_with_optional_fallback(
+    ua: np.ndarray,
+    va: np.ndarray,
+    pres_pa: np.ndarray,
+    z_field: np.ndarray,
+    z_target: float,
+    allow_fallback: bool,
+    dz: float,
+    verbose: bool,
+    label: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
+    """
+    Returns (ua_z, va_z, p_z, z_used, used_fallback)
+    """
+    ua_z = _interplevel_timewise(ua, z_field, z_target)
+    va_z = _interplevel_timewise(va, z_field, z_target)
+    p_z = _interplevel_timewise(pres_pa, z_field, z_target)
+
+    nan_all = (
+        np.isnan(np.asarray(ua_z)).all()
+        and np.isnan(np.asarray(va_z)).all()
+        and np.isnan(np.asarray(p_z)).all()
+    )
+
+    if verbose:
+        zmin = float(np.nanmin(np.asarray(z_field)))
+        zmax = float(np.nanmax(np.asarray(z_field)))
+        print(f"[{label}] z_field range: {zmin:.2f} .. {zmax:.2f} m, target={z_target:.2f}")
+        print(
+            f"  NaN frac ua_z={_nan_frac(ua_z):.3f}, va_z={_nan_frac(va_z):.3f}, p_z={_nan_frac(p_z):.3f}"
+        )
+
+    if (not nan_all) or (not allow_fallback):
+        return np.asarray(ua_z), np.asarray(va_z), np.asarray(p_z), float(z_target), False
+
+    # Fallback: z = zmin + dz
+    zmin = float(np.nanmin(np.asarray(z_field)))
+    z_fallback = zmin + dz
+    if verbose:
+        print(f"[{label}] interplevel all-NaN at z={z_target:.2f}; falling back to z={z_fallback:.2f} (zmin+dz)")
+
+    ua_z2 = _interplevel_timewise(ua, z_field, z_fallback)
+    va_z2 = _interplevel_timewise(va, z_field, z_fallback)
+    p_z2 = _interplevel_timewise(pres_pa, z_field, z_fallback)
+
+    if verbose:
+        print(
+            f"  Fallback NaN frac ua_z={_nan_frac(ua_z2):.3f}, va_z={_nan_frac(va_z2):.3f}, p_z={_nan_frac(p_z2):.3f}"
+        )
+
+    return np.asarray(ua_z2), np.asarray(va_z2), np.asarray(p_z2), float(z_fallback), True
+
+def _expand_inputs(inputs: List[str], verbose: bool = False) -> List[str]:
+    """Expand user inputs (files/dirs/globs) into a sorted list of NetCDF files.
+
+    Rules:
+      - If an entry is a directory, include *.nc in that directory (non-recursive).
+      - If an entry contains glob metacharacters (* ? [), expand it.
+      - Otherwise, treat as a file path.
+
+    Returns a de-duplicated list preserving sorted order.
+    """
+    import glob
+    import os
+
+    expanded: List[str] = []
+    for item in inputs:
+        item = os.path.expanduser(os.path.expandvars(item))
+        if any(ch in item for ch in ["*", "?", "["]):
+            expanded.extend(sorted(glob.glob(item)))
+        elif os.path.isdir(item):
+            expanded.extend(sorted(glob.glob(os.path.join(item, "*.nc"))))
+        else:
+            expanded.append(item)
+
+    # De-duplicate while preserving order
+    seen = set()
+    out: List[str] = []
+    for f in expanded:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+
+    if verbose:
+        print(f"[inputs] expanded to {len(out)} files")
+
+    if len(out) == 0:
+        raise FileNotFoundError("No input NetCDF files found from provided paths/globs/directories.")
+
+    return out
+
+
+# -----------------------------
+# Main
+# -----------------------------
 def main() -> None:
     args = parse_args()
-    out_nc = Path(args.output).expanduser()
+    files: List[str] = _expand_inputs(args.files, verbose=args.verbose)
+    out_path: str = args.output
 
-    files = expand_inputs(args.inputs, args.glob, args.verbose)
-    files = sort_inputs(files, args.sort, args.verbose)
+    output_exists = os.path.exists(out_path)
 
-    if out_nc.exists() and not args.force:
-        vprint(args.verbose, f"[main] output exists, skipping extraction: {out_nc}")
-    else:
-        extract(
-            files,
-            out_nc,
-            z=float(args.z),
-            zref=str(args.z_ref),
-            z_auto=bool(args.z_auto),
-            dz=float(args.z_auto_dz),
-            no_fallback=bool(args.no_z_fallback),
-            keep_geo=bool(args.keep_geo),
-            compression=int(args.compression),
-            verbose=bool(args.verbose),
+    # Decide whether to (re)build the output file
+    do_extract = True
+    if output_exists and not args.force:
+        do_extract = False
+        print(f"Output exists, skipping extraction (use --force to overwrite): {out_path}")
+    elif output_exists and args.force:
+        print(f"Output exists, overwriting due to --force: {out_path}")
+        os.remove(out_path)
+
+    if do_extract:
+        # Define grid from first file
+        with Dataset(files[0]) as nc0:
+            sn = nc0.dimensions["south_north"].size
+            we = nc0.dimensions["west_east"].size
+            datestrlen = nc0.dimensions["DateStrLen"].size if "DateStrLen" in nc0.dimensions else 19
+            static = _get_static_fields(nc0)
+
+        # Create output file with unlimited Time
+        with Dataset(out_path, "w", format="NETCDF4") as out_nc:
+            out_nc.createDimension("Time", None)
+            out_nc.createDimension("DateStrLen", datestrlen)
+            out_nc.createDimension("south_north", sn)
+            out_nc.createDimension("west_east", we)
+
+            out_nc.createVariable("Times", "S1", ("Time", "DateStrLen"))
+            out_nc.createVariable("XTIME", "f4", ("Time",))
+
+            comp = dict(zlib=(args.compression > 0), complevel=args.compression)
+            chunks = (1, sn, we)
+
+            v_u = out_nc.createVariable("U", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp)
+            v_v = out_nc.createVariable("V", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp)
+            v_p = out_nc.createVariable("P", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp)
+
+            v_u.units = "m s-1"
+            v_v.units = "m s-1"
+            v_p.units = "Pa"
+
+            # Store requested settings; effective z may vary by file if fallback/auto is used
+            out_nc.setncattr("wrf_extract_requested_z_m", float(args.z))
+            out_nc.setncattr("wrf_extract_z_ref", args.z_ref)
+            out_nc.setncattr("wrf_extract_z_auto", int(bool(args.z_auto)))
+            out_nc.setncattr("wrf_extract_z_auto_dz_m", float(args.z_auto_dz))
+            out_nc.setncattr("wrf_extract_z_fallback_enabled", int(not args.no_z_fallback))
+            out_nc.setncattr("source_files", " ".join(files))
+
+            if args.keep_geo:
+                if "XLAT" in static:
+                    v_lat = out_nc.createVariable("XLAT", "f4", ("south_north", "west_east"))
+                    v_lat[:] = static["XLAT"]
+                    v_lat.units = "degrees_north"
+                if "XLONG" in static:
+                    v_lon = out_nc.createVariable("XLONG", "f4", ("south_north", "west_east"))
+                    v_lon[:] = static["XLONG"]
+                    v_lon.units = "degrees_east"
+                if "HGT" in static:
+                    v_hgt = out_nc.createVariable("HGT", "f4", ("south_north", "west_east"))
+                    v_hgt[:] = static["HGT"]
+                    v_hgt.units = "m"
+
+            t_out = 0
+            for fi, f in enumerate(files, start=1):
+                print(f"[{fi}/{len(files)}] Processing: {os.path.basename(f)}")
+                with Dataset(f) as nc:
+                    _ensure_same_hgrid(nc, sn, we)
+
+                    times = nc.variables["Times"][:, :]
+                    xtime = nc.variables["XTIME"][:].astype("f4")
+                    nt = times.shape[0]
+
+                    # WRF-aware vars
+                    ua = getvar(nc, "ua", timeidx=ALL_TIMES)  # m/s
+                    va = getvar(nc, "va", timeidx=ALL_TIMES)  # m/s
+                    pres_hpa = getvar(nc, "pressure", timeidx=ALL_TIMES)  # hPa
+                    pres_pa = pres_hpa * 100.0
+                    z_msl = getvar(nc, "z", timeidx=ALL_TIMES)  # m MSL (mass grid)
+
+                    if args.z_ref == "agl":
+                        if "HGT" not in nc.variables:
+                            raise KeyError("Requested --z-ref agl but HGT is missing in file.")
+                        hgt = nc.variables["HGT"][0, :, :] if nc.variables["HGT"].ndim == 3 else nc.variables["HGT"][:, :]
+                        z_field = z_msl - hgt[None, None, :, :]
+                    else:
+                        z_field = z_msl
+
+                    # Choose requested z for this file (auto or user-specified)
+                    z_req = _choose_target_z(
+                        z_field=z_field,
+                        requested_z=float(args.z),
+                        z_auto=bool(args.z_auto),
+                        dz=float(args.z_auto_dz),
+                    )
+
+                    # Interpolate with optional fallback if all-NaN
+                    ua_z, va_z, p_z, z_used, used_fallback = _interplevel_with_optional_fallback(
+                        ua=ua,
+                        va=va,
+                        pres_pa=pres_pa,
+                        z_field=z_field,
+                        z_target=z_req,
+                        allow_fallback=(not args.no_z_fallback) and (not args.z_auto),
+                        dz=float(args.z_auto_dz),
+                        verbose=bool(args.verbose),
+                        label=os.path.basename(f),
+                    )
+
+                    if used_fallback:
+                        print(f"  NOTE: used fallback z={z_used:.2f} m for {os.path.basename(f)}")
+
+                    # Write time + fields
+                    out_nc.variables["Times"][t_out:t_out + nt, :] = times
+                    out_nc.variables["XTIME"][t_out:t_out + nt] = xtime
+                    out_nc.variables["U"][t_out:t_out + nt, :, :] = np.asarray(ua_z, dtype="f4")
+                    out_nc.variables["V"][t_out:t_out + nt, :, :] = np.asarray(va_z, dtype="f4")
+                    out_nc.variables["P"][t_out:t_out + nt, :, :] = np.asarray(p_z, dtype="f4")
+
+                    t_out += nt
+
+            # Update long_name after the fact (since effective z may vary by file)
+            v_u.long_name = f"U wind interpolated to z (see attributes; requested z={float(args.z)} m, ref={args.z_ref})"
+            v_v.long_name = f"V wind interpolated to z (see attributes; requested z={float(args.z)} m, ref={args.z_ref})"
+            v_p.long_name = f"Pressure interpolated to z (see attributes; requested z={float(args.z)} m, ref={args.z_ref})"
+
+            out_nc.sync()
+
+        print(f"Wrote collated file: {out_path}")
+
+    # Plots/movies should run even if extraction was skipped (output already existed).
+    if args.plot:
+        quicklook_plot(
+            out_path,
+            args.plot_kind,
+            args.plot_time,
+            args.plot_out,
+            args.plot_show,
+            plot_step=args.plot_step,
+            plot_domain=args.plot_domain,
+            plot_bbox=args.plot_bbox,
         )
-        print(f"Wrote: {out_nc}")
 
-    # Optional quicklook/movie operate on existing output
-    if args.plot or args.movie:
-        import xarray as xr
-        ds = xr.open_dataset(out_nc)
-
-        bbox = tuple(args.plot_bbox) if args.plot_bbox is not None else None
-
-        if args.plot:
-            out_png = args.plot_out
-            if out_png is None and not args.plot_show:
-                out_png = str(out_nc.with_suffix(f".{args.plot_kind}.png"))
-            sc_spd = sc_p = None
-            if args.plot_fixed_scale:
-                sc_spd, sc_p = _compute_movie_scales(ds, fixed_scale=True, scale_mode="percentile", pmin=1.0, pmax=99.0)
-            _plot_quicklook(ds, args.plot_time, args.plot_kind, out_png, args.plot_show,
-                            max(1, args.plot_step), bbox, fixed_scale=bool(args.plot_fixed_scale),
-                            scale_speed=sc_spd, scale_pressure=sc_p)
-
-        if args.movie:
-            make_movie(
-                out_nc,
-                kind=args.movie_kind,
-                fps=args.movie_fps,
-                every=args.movie_every,
-                out_mp4=args.movie_out,
-                ffmpeg=args.ffmpeg,
-                keep_frames=args.keep_frames,
-                fixed_scale=bool(args.movie_fixed_scale),
-                scale_mode=str(args.movie_scale),
-                pmin=float(args.movie_pmin),
-                pmax=float(args.movie_pmax),
-                verbose=bool(args.verbose),
-                step=max(1, args.plot_step),
-                bbox=bbox,
-            )
-
-        ds.close()
+    if args.movie:
+        make_movie(
+            out_path,
+            args.movie_kind,
+            args.movie_fps,
+            args.movie_every,
+            args.movie_out,
+            args.ffmpeg,
+            args.keep_frames,
+            verbose=bool(args.verbose),
+            plot_step=args.plot_step,
+            plot_domain=args.plot_domain,
+            plot_bbox=args.plot_bbox,
+            fixed_scale=args.movie_fixed_scale,
+            scale_mode=args.movie_scale,
+            pmin=args.movie_pmin,
+            pmax=args.movie_pmax,
+        )
 
 
 if __name__ == "__main__":
