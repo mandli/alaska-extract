@@ -71,17 +71,3 @@ pixi run -e regrid precommit-install
 ```
 
 Both scripts support `--version`.
-
-## Unified CLI (optional)
-
-From the repo checkout, you can use the `alaska-extract` wrapper for a consistent interface:
-
-```bash
-# In the wrf env
-pixi run -e wrf alaska-extract extract -- <extract-args>
-
-# In the regrid env
-pixi run -e regrid alaska-extract regrid -- <regrid-args>
-```
-
-(These delegate to the top-level scripts so the two pixi environments can stay cleanly separated.)
