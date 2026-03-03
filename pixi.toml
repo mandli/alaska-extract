@@ -51,7 +51,7 @@ check-wrf = "python -c \"import numpy; print('numpy', numpy.__version__)\""
 check-esmf = "python -c \"import esmpy, xesmf, numpy; print('esmpy', esmpy.__version__, '| xesmf', xesmf.__version__, '| numpy', numpy.__version__)\""
 extract = "python wrf_extract_uvp_at_z.py"
 regrid  = "python wrf_regrid_uvp_to_latlon.py"
-test = "pytest"
+test = "PYTHONPATH=. pytest"
 
 lint = "ruff check ."
 format = "ruff format ."
