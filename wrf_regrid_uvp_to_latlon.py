@@ -18,33 +18,28 @@ Requires (regrid env):
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
-import subprocess
 from pathlib import Path
-from typing import Optional, Tuple
 
 import numpy as np
 import xarray as xr
 import xesmf as xe
 from scipy.ndimage import distance_transform_edt
 
-from alaska_extract.version import VERSION
-from alaska_extract.plotting import movie_from_frames
-
 from alaska_extract.common import (
     decode_wrf_times,
-    find_ffmpeg,
     infer_lon_center,
     lon_continuous_about,
     sanitize_netcdf_attrs,
     vprint,
 )
-
+from alaska_extract.plotting import movie_from_frames
+from alaska_extract.version import VERSION
 
 # =============================================================================
 # Grid helpers
 # =============================================================================
+
 
 def _make_1d_axis(lo: float, hi: float, d: float) -> np.ndarray:
     if d <= 0:
@@ -55,13 +50,17 @@ def _make_1d_axis(lo: float, hi: float, d: float) -> np.ndarray:
     return lo + d * np.arange(n, dtype=np.float64)
 
 
-def _make_target_grid(lon0: float, lon1: float, lat0: float, lat1: float, dlon: float, dlat: float) -> xr.Dataset:
+def _make_target_grid(
+    lon0: float, lon1: float, lat0: float, lat1: float, dlon: float, dlat: float
+) -> xr.Dataset:
     lon_t = _make_1d_axis(lon0, lon1, dlon)
     lat_t = _make_1d_axis(lat0, lat1, dlat)
     return xr.Dataset(coords={"lon": ("lon", lon_t), "lat": ("lat", lat_t)})
 
 
-def _infer_bbox_from_file(ds: xr.Dataset, pad_deg: float = 0.0) -> Tuple[float, float, float, float, float]:
+def _infer_bbox_from_file(
+    ds: xr.Dataset, pad_deg: float = 0.0
+) -> tuple[float, float, float, float, float]:
     if "XLAT" not in ds or "XLONG" not in ds:
         raise KeyError("Input must contain XLAT/XLONG. Re-run extractor with --keep-geo.")
     lat = ds["XLAT"].values.astype(np.float64)
@@ -92,6 +91,7 @@ def _decode_time_for_title(ds: xr.Dataset, t_index: int) -> str:
 # =============================================================================
 # Optional metrics
 # =============================================================================
+
 
 def add_latlon_metrics(ds_ll: xr.Dataset, dlon_deg: float, dlat_deg: float, R: float) -> xr.Dataset:
     lat = ds_ll["lat"].astype(np.float64)
@@ -136,6 +136,7 @@ def add_latlon_metrics(ds_ll: xr.Dataset, dlon_deg: float, dlat_deg: float, R: f
 # Fill + relax
 # =============================================================================
 
+
 def inpaint_nearest_2d(field2d: np.ndarray, valid2d: np.ndarray) -> np.ndarray:
     field2d = np.asarray(field2d, dtype=np.float64)
     valid2d = np.asarray(valid2d, dtype=bool)
@@ -156,7 +157,7 @@ def relax_invalid_to_bg(
     dlon_deg: float,
     radius_deg: float,
     bg_value: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Relax ONLY invalid region (where ~valid2d) toward bg_value with cosine taper
     vs. distance to nearest valid cell.
@@ -274,8 +275,11 @@ def fill_and_relax(
                 valid_t = cov_valid
 
             if verbose and t == 0:
-                vprint(verbose, f"[fill+relax] {var}: valid_ref_frac={float(np.mean(valid_ref)):.3f} "
-                                f"valid_t0_frac={float(np.mean(valid_t)):.3f}")
+                vprint(
+                    verbose,
+                    f"[fill+relax] {var}: valid_ref_frac={float(np.mean(valid_ref)):.3f} "
+                    f"valid_t0_frac={float(np.mean(valid_t)):.3f}",
+                )
 
             f_filled = inpaint_nearest_2d(f, valid_t) if do_fill else f.copy()
 
@@ -327,13 +331,17 @@ def fill_and_relax(
 # Plotting / diagnostics
 # =============================================================================
 
+
 def _matplotlib_setup(show: bool) -> None:
     if not show:
         import matplotlib
+
         matplotlib.use("Agg")
 
 
-def quicklook_plot(ds_ll: xr.Dataset, kind: str, t_index: int, out_png: Optional[str], show: bool) -> None:
+def quicklook_plot(
+    ds_ll: xr.Dataset, kind: str, t_index: int, out_png: str | None, show: bool
+) -> None:
     _matplotlib_setup(show)
     import matplotlib.pyplot as plt
 
@@ -433,10 +441,18 @@ def diagnostic_plot(
 
     w = ds_ll["blend_weight"].values if "blend_weight" in ds_ll else None
     cov = ds_ll["coverage"].values if include_coverage and "coverage" in ds_ll else None
-    dist = ds_ll["dist_to_valid_deg"].values if include_distance and "dist_to_valid_deg" in ds_ll else None
+    dist = (
+        ds_ll["dist_to_valid_deg"].values
+        if include_distance and "dist_to_valid_deg" in ds_ll
+        else None
+    )
 
     vm = ds_ll["orig_valid_mask"].values.astype(float) if "orig_valid_mask" in ds_ll else None
-    om = ds_ll["original_missing_mask"].values.astype(float) if (contour_original_missing and "original_missing_mask" in ds_ll) else None
+    om = (
+        ds_ll["original_missing_mask"].values.astype(float)
+        if (contour_original_missing and "original_missing_mask" in ds_ll)
+        else None
+    )
 
     Pbg = float(ds_ll.attrs.get("background_pressure_Pa", 101325.0))
     title_time = _decode_time_for_title(ds_ll, t_index)
@@ -449,7 +465,7 @@ def diagnostic_plot(
         return float(np.percentile(a, pmin)), float(np.percentile(a, pmax))
 
     if fixed_scale:
-        spd_vmin, spd_vmax = _range_for(np.sqrt(ds_ll["U"].values**2 + ds_ll["V"].values**2))
+        spd_vmin, spd_vmax = _range_for(np.sqrt(ds_ll["U"].values ** 2 + ds_ll["V"].values ** 2))
         if use_anom:
             p_vmin, p_vmax = _range_for(ds_ll["P"].values - Pbg)
         else:
@@ -460,7 +476,9 @@ def diagnostic_plot(
     panels = []
     panels.append(("Wind speed", spd, "Wind speed (m/s)", {"vmin": spd_vmin, "vmax": spd_vmax}))
     if use_anom:
-        panels.append(("Pressure anomaly", P - Pbg, "P - Pbg (Pa)", {"vmin": p_vmin, "vmax": p_vmax}))
+        panels.append(
+            ("Pressure anomaly", P - Pbg, "P - Pbg (Pa)", {"vmin": p_vmin, "vmax": p_vmax})
+        )
     else:
         panels.append(("Pressure", P, "Pressure (Pa)", {"vmin": p_vmin, "vmax": p_vmax}))
 
@@ -476,7 +494,7 @@ def diagnostic_plot(
     if n == 1:
         axes = [axes]
 
-    for ax, (title, arr, cblabel, opts) in zip(axes, panels):
+    for ax, (title, arr, cblabel, opts) in zip(axes, panels, strict=True):
         marr = np.ma.masked_invalid(np.asarray(arr, dtype=np.float64))
         # drop None vmin/vmax entries
         opts = {k: v for k, v in opts.items() if v is not None}
@@ -508,7 +526,7 @@ def diag_movie(
     *,
     fps: int = 12,
     every: int = 1,
-    frames_dir: Optional[str] = None,
+    frames_dir: str | None = None,
     ffmpeg: str = "ffmpeg",
     keep_frames: bool = False,
     use_anom: bool = False,
@@ -526,7 +544,9 @@ def diag_movie(
     frames_path = Path(frames_dir) if frames_dir is not None else Path("_diag_frames")
     frames_path.mkdir(parents=True, exist_ok=True)
 
-    vprint(verbose, f"[diag-movie] Time={tsize}, every={every}, fps={fps}, frames_dir={frames_path}")
+    vprint(
+        verbose, f"[diag-movie] Time={tsize}, every={every}, fps={fps}, frames_dir={frames_path}"
+    )
 
     frame_idx = 0
     for t in range(0, tsize, every):
@@ -547,9 +567,14 @@ def diag_movie(
         frame_idx += 1
 
     # Assemble MP4 from frames
-    movie_from_frames(frames_path, Path(out_mp4), fps=int(fps), ffmpeg=ffmpeg, verbose=bool(verbose),
-                      keep_frames=bool(keep_frames))
-
+    movie_from_frames(
+        frames_path,
+        Path(out_mp4),
+        fps=int(fps),
+        ffmpeg=ffmpeg,
+        verbose=bool(verbose),
+        keep_frames=bool(keep_frames),
+    )
 
     if not keep_frames:
         shutil.rmtree(frames_path, ignore_errors=True)
@@ -560,31 +585,50 @@ def diag_movie(
 # CLI
 # =============================================================================
 
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Regrid extracted WRF U/V/P to regular lat/lon using xESMF.")
+    p = argparse.ArgumentParser(
+        description="Regrid extracted WRF U/V/P to regular lat/lon using xESMF."
+    )
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
 
     p.add_argument("input", help="Input NetCDF (from extractor; must contain XLAT/XLONG + U/V/P).")
     p.add_argument("-o", "--output", required=True, help="Output NetCDF (regular lat/lon).")
     p.add_argument("--force", action="store_true", help="Overwrite output if it exists.")
 
-    p.add_argument("--bbox", nargs=4, type=float, metavar=("LON0", "LON1", "LAT0", "LAT1"),
-                   default=None, help="Target bounds. If omitted, inferred from input.")
-    p.add_argument("--infer-pad", type=float, default=0.0, help="Padding added around inferred bbox (deg).")
+    p.add_argument(
+        "--bbox",
+        nargs=4,
+        type=float,
+        metavar=("LON0", "LON1", "LAT0", "LAT1"),
+        default=None,
+        help="Target bounds. If omitted, inferred from input.",
+    )
+    p.add_argument(
+        "--infer-pad", type=float, default=0.0, help="Padding added around inferred bbox (deg)."
+    )
     p.add_argument("--dlon", type=float, required=True, help="Target lon resolution (deg).")
     p.add_argument("--dlat", type=float, required=True, help="Target lat resolution (deg).")
 
     p.add_argument("--method", choices=["bilinear", "nearest_s2d"], default="bilinear")
-    p.add_argument("--reuse-weights", action="store_true", help="Reuse <output>.weights.nc if present.")
+    p.add_argument(
+        "--reuse-weights", action="store_true", help="Reuse <output>.weights.nc if present."
+    )
 
     p.add_argument("--blend-radius-deg", type=float, default=2.0)
     p.add_argument("--p-background", type=float, default=1013.25, help="Background pressure (hPa).")
     p.add_argument("--coverage-threshold", type=float, default=0.99)
 
-    p.add_argument("--no-domain-edge", action="store_true", help="Don't use coverage footprint in validity.")
-    p.add_argument("--no-nan-edge", action="store_true", help="Don't use per-time NaNs in validity.")
+    p.add_argument(
+        "--no-domain-edge", action="store_true", help="Don't use coverage footprint in validity."
+    )
+    p.add_argument(
+        "--no-nan-edge", action="store_true", help="Don't use per-time NaNs in validity."
+    )
 
-    p.add_argument("--fill-missing", action="store_true", help="Enable nearest-neighbor fill (default ON).")
+    p.add_argument(
+        "--fill-missing", action="store_true", help="Enable nearest-neighbor fill (default ON)."
+    )
     p.add_argument("--no-fill-missing", action="store_true", help="Disable nearest-neighbor fill.")
     p.add_argument("--relax-filled", action="store_true", help="Enable relaxation (default ON).")
     p.add_argument("--no-relax-filled", action="store_true", help="Disable relaxation.")
@@ -606,8 +650,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diag-include-coverage", action="store_true")
     p.add_argument("--diag-no-distance", action="store_true")
     p.add_argument("--diag-no-orig-contour", action="store_true")
-    p.add_argument("--diag-fixed-scale", action="store_true", default=True,
-                   help="Anchor colorbars (default ON).")
+    p.add_argument(
+        "--diag-fixed-scale",
+        action="store_true",
+        default=True,
+        help="Anchor colorbars (default ON).",
+    )
     p.add_argument("--no-diag-fixed-scale", dest="diag_fixed_scale", action="store_false")
 
     p.add_argument("--diag-pmin", type=float, default=1.0)
@@ -640,23 +688,35 @@ def main() -> None:
         ds = xr.open_dataset(inp)
 
         if args.bbox is None:
-            lon0, lon1, lat0, lat1, lon_center = _infer_bbox_from_file(ds, pad_deg=float(args.infer_pad))
+            lon0, lon1, lat0, lat1, lon_center = _infer_bbox_from_file(
+                ds, pad_deg=float(args.infer_pad)
+            )
         else:
             LON0, LON1, LAT0, LAT1 = args.bbox
             lon_center = infer_lon_center(ds["XLONG"].values)
-            lon0 = float(lon_continuous_about(np.array(LON0), center_deg=lon_center)) - float(args.infer_pad)
-            lon1 = float(lon_continuous_about(np.array(LON1), center_deg=lon_center)) + float(args.infer_pad)
+            lon0 = float(lon_continuous_about(np.array(LON0), center_deg=lon_center)) - float(
+                args.infer_pad
+            )
+            lon1 = float(lon_continuous_about(np.array(LON1), center_deg=lon_center)) + float(
+                args.infer_pad
+            )
             lat0 = max(-90.0, min(LAT0, LAT1) - float(args.infer_pad))
             lat1 = min(90.0, max(LAT0, LAT1) + float(args.infer_pad))
             if lon1 < lon0:
                 lon0, lon1 = lon1, lon0
 
-        vprint(args.verbose, f"[bbox] lon=[{lon0:.3f},{lon1:.3f}] lat=[{lat0:.3f},{lat1:.3f}] center≈{lon_center:.2f}")
+        vprint(
+            args.verbose,
+            f"[bbox] lon=[{lon0:.3f},{lon1:.3f}] lat=[{lat0:.3f},{lat1:.3f}] center≈{lon_center:.2f}",
+        )
 
         ds_tgt = _make_target_grid(lon0, lon1, lat0, lat1, float(args.dlon), float(args.dlat))
 
         ds_src = ds.assign_coords(
-            lon=(("south_north", "west_east"), lon_continuous_about(ds["XLONG"].values, center_deg=lon_center)),
+            lon=(
+                ("south_north", "west_east"),
+                lon_continuous_about(ds["XLONG"].values, center_deg=lon_center),
+            ),
             lat=(("south_north", "west_east"), ds["XLAT"].values),
         )
 
@@ -669,7 +729,9 @@ def main() -> None:
         reuse = bool(weights_path and Path(weights_path).exists())
 
         regridder = xe.Regridder(
-            ds_in, ds_tgt, args.method,
+            ds_in,
+            ds_tgt,
+            args.method,
             periodic=False,
             unmapped_to_nan=True,
             reuse_weights=reuse,
@@ -680,7 +742,9 @@ def main() -> None:
 
         ones_src = xr.ones_like(ds_in["P"].isel(Time=0), dtype=np.float64)
         cov = regridder(ones_src)
-        ds_out["coverage"] = cov.assign_attrs({"long_name": "Regridding coverage (1≈mapped, 0≈unmapped)", "units": "1"})
+        ds_out["coverage"] = cov.assign_attrs(
+            {"long_name": "Regridding coverage (1≈mapped, 0≈unmapped)", "units": "1"}
+        )
 
         # carry Times/XTIME if present
         for v in ("Times", "XTIME"):
@@ -728,7 +792,9 @@ def main() -> None:
         )
 
         if args.add_metrics:
-            ds_out = add_latlon_metrics(ds_out, float(args.dlon), float(args.dlat), float(args.earth_radius_m))
+            ds_out = add_latlon_metrics(
+                ds_out, float(args.dlon), float(args.dlat), float(args.earth_radius_m)
+            )
 
         ds_out.attrs = sanitize_netcdf_attrs(ds_out.attrs)
 

@@ -38,7 +38,6 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
 from netCDF4 import Dataset
@@ -58,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Overwrite output file if it exists. If not set and output exists, extraction is skipped "
-             "(but plot/movie can still run).",
+        "(but plot/movie can still run).",
     )
     p.add_argument(
         "--verbose",
@@ -66,7 +65,9 @@ def parse_args() -> argparse.Namespace:
         help="Verbose logging (prints diagnostics like z-range and NaN fractions, plus extra details).",
     )
 
-    p.add_argument("--z", type=float, default=0.0, help="Target height in meters. Default: 0 (MSL).")
+    p.add_argument(
+        "--z", type=float, default=0.0, help="Target height in meters. Default: 0 (MSL)."
+    )
     p.add_argument(
         "--z-ref",
         choices=["msl", "agl"],
@@ -79,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         "--z-auto",
         action="store_true",
         help="Ignore --z and instead use (zmin + dz) where zmin is the minimum of the chosen z_field "
-             "for each file. Use --z-auto-dz to set dz.",
+        "for each file. Use --z-auto-dz to set dz.",
     )
     p.add_argument(
         "--z-auto-dz",
@@ -93,7 +94,9 @@ def parse_args() -> argparse.Namespace:
         help="Disable automatic fallback if interplevel returns all-NaN at requested z.",
     )
 
-    p.add_argument("--compression", type=int, default=4, help="NetCDF deflate level (0-9). Default: 4.")
+    p.add_argument(
+        "--compression", type=int, default=4, help="NetCDF deflate level (0-9). Default: 4."
+    )
     p.add_argument(
         "--keep-geo",
         action="store_true",
@@ -102,17 +105,27 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Plotting
-    p.add_argument("--plot", action="store_true", help="Generate a quick-look plot from the collated file.")
-    p.add_argument("--plot-time", type=int, default=0, help="Time index to plot (0-based). Default: 0.")
+    p.add_argument(
+        "--plot", action="store_true", help="Generate a quick-look plot from the collated file."
+    )
+    p.add_argument(
+        "--plot-time", type=int, default=0, help="Time index to plot (0-based). Default: 0."
+    )
     p.add_argument(
         "--plot-kind",
         choices=["speed", "pressure", "quiver", "both"],
         default="speed",
         help="What to plot. 'both' makes a 1x2 subplot (speed + pressure). Default: speed.",
     )
-    p.add_argument("--plot-out", default=None, help="Output png filename. Default is derived from nc name.")
-    p.add_argument("--plot-show", action="store_true", help="Show interactively instead of saving a PNG.")
-    p.add_argument("--plot-step", type=int, default=1, help="Subsample every N grid points (>=1). Default: 1.")
+    p.add_argument(
+        "--plot-out", default=None, help="Output png filename. Default is derived from nc name."
+    )
+    p.add_argument(
+        "--plot-show", action="store_true", help="Show interactively instead of saving a PNG."
+    )
+    p.add_argument(
+        "--plot-step", type=int, default=1, help="Subsample every N grid points (>=1). Default: 1."
+    )
     p.add_argument(
         "--plot-domain",
         nargs=4,
@@ -131,7 +144,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Movies
-    p.add_argument("--movie", action="store_true", help="Make an MP4 movie via ffmpeg from the collated output.")
+    p.add_argument(
+        "--movie",
+        action="store_true",
+        help="Make an MP4 movie via ffmpeg from the collated output.",
+    )
     p.add_argument(
         "--movie-kind",
         choices=["speed", "pressure", "quiver", "both"],
@@ -139,9 +156,13 @@ def parse_args() -> argparse.Namespace:
         help="Field to animate. Default: speed.",
     )
     p.add_argument("--movie-fps", type=int, default=10, help="Movie FPS. Default: 10.")
-    p.add_argument("--movie-every", type=int, default=1, help="Use every Nth timestep (>=1). Default: 1.")
+    p.add_argument(
+        "--movie-every", type=int, default=1, help="Use every Nth timestep (>=1). Default: 1."
+    )
     p.add_argument("--movie-out", default=None, help="Movie filename. Default: <base>_<kind>.mp4")
-    p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable (name or full path). Default: ffmpeg")
+    p.add_argument(
+        "--ffmpeg", default="ffmpeg", help="ffmpeg executable (name or full path). Default: ffmpeg"
+    )
     p.add_argument("--keep-frames", action="store_true", help="Keep intermediate PNG frames.")
 
     # Movie scaling controls
@@ -163,8 +184,18 @@ def parse_args() -> argparse.Namespace:
         default="minmax",
         help="How to compute fixed scaling. Default: minmax.",
     )
-    p.add_argument("--movie-pmin", type=float, default=1.0, help="Lower percentile for percentile scaling. Default: 1.")
-    p.add_argument("--movie-pmax", type=float, default=99.0, help="Upper percentile for percentile scaling. Default: 99.")
+    p.add_argument(
+        "--movie-pmin",
+        type=float,
+        default=1.0,
+        help="Lower percentile for percentile scaling. Default: 1.",
+    )
+    p.add_argument(
+        "--movie-pmax",
+        type=float,
+        default=99.0,
+        help="Upper percentile for percentile scaling. Default: 99.",
+    )
 
     return p.parse_args()
 
@@ -199,7 +230,7 @@ def _read_timestr(nc: Dataset, t_index: int) -> str:
     return ts if ts else f"t={t_index}"
 
 
-def _get_xy(nc: Dataset) -> Tuple[np.ndarray, np.ndarray, str, str]:
+def _get_xy(nc: Dataset) -> tuple[np.ndarray, np.ndarray, str, str]:
     has_geo = ("XLAT" in nc.variables) and ("XLONG" in nc.variables)
     if has_geo:
         lat = np.asarray(nc.variables["XLAT"][:, :], dtype=np.float64)
@@ -219,9 +250,9 @@ def _get_xy(nc: Dataset) -> Tuple[np.ndarray, np.ndarray, str, str]:
 
 def _domain_slices_from_indices(
     nc: Dataset,
-    plot_domain: Optional[List[int]],
+    plot_domain: list[int] | None,
     plot_step: int,
-) -> Tuple[slice, slice]:
+) -> tuple[slice, slice]:
     """Return (south_north slice, west_east slice)."""
     if plot_step < 1:
         raise ValueError("--plot-step must be >= 1")
@@ -244,7 +275,7 @@ def _domain_slices_from_indices(
     return slice(j0, j1, plot_step), slice(i0, i1, plot_step)
 
 
-def _bbox_to_index_domain(nc: Dataset, bbox: List[float]) -> List[int]:
+def _bbox_to_index_domain(nc: Dataset, bbox: list[float]) -> list[int]:
     """
     Convert lon/lat bbox to an index-domain [I0,I1,J0,J1] that covers the bbox.
 
@@ -260,7 +291,9 @@ def _bbox_to_index_domain(nc: Dataset, bbox: List[float]) -> List[int]:
     Note: This assumes your bbox does not intend to select "the long way around" the globe.
     """
     if "XLAT" not in nc.variables or "XLONG" not in nc.variables:
-        raise KeyError("XLAT/XLONG not found; --plot-bbox requires --keep-geo when creating output.")
+        raise KeyError(
+            "XLAT/XLONG not found; --plot-bbox requires --keep-geo when creating output."
+        )
 
     lon0, lon1, lat0, lat1 = bbox
     la = min(lat0, lat1)
@@ -300,9 +333,9 @@ def _bbox_to_index_domain(nc: Dataset, bbox: List[float]) -> List[int]:
 
 def _resolve_plot_domain(
     nc: Dataset,
-    plot_domain: Optional[List[int]],
-    plot_bbox: Optional[List[float]],
-) -> Optional[List[int]]:
+    plot_domain: list[int] | None,
+    plot_bbox: list[float] | None,
+) -> list[int] | None:
     if plot_domain is not None and plot_bbox is not None:
         raise ValueError("Use only one of --plot-domain or --plot-bbox (not both).")
     if plot_bbox is not None:
@@ -317,7 +350,6 @@ def _nan_frac(a: np.ndarray) -> float:
     return float(np.isnan(aa).mean())
 
 
-
 def _interplevel_timewise(field, z_field, z_target):
     """Apply wrf.interplevel in a time-safe way.
 
@@ -328,7 +360,6 @@ def _interplevel_timewise(field, z_field, z_target):
 
     This helper forces 3D-per-time interpolation for 4D inputs and then stacks.
     """
-    from wrf import interplevel  # local import keeps module import light
 
     field_ndim = getattr(field, "ndim", np.asarray(field).ndim)
     z_ndim = getattr(z_field, "ndim", np.asarray(z_field).ndim)
@@ -352,6 +383,7 @@ def _interplevel_timewise(field, z_field, z_target):
 
     return np.stack(out, axis=0)
 
+
 def _unwrap_lon(lon_deg: np.ndarray) -> np.ndarray:
     """Unwrap longitude along west_east so there is no antimeridian jump (for plotting)."""
     lon = np.asarray(lon_deg, dtype=np.float64)
@@ -363,6 +395,7 @@ def _lon_to_360(lon_deg: np.ndarray) -> np.ndarray:
     lon = np.asarray(lon_deg, dtype=np.float64)
     return np.mod(lon, 360.0)
 
+
 # -----------------------------
 # Plotting
 # -----------------------------
@@ -370,18 +403,19 @@ def quicklook_plot(
     nc_path: str,
     kind: str,
     t_index: int,
-    out_png: Optional[str],
+    out_png: str | None,
     show: bool,
     plot_step: int = 1,
-    plot_domain: Optional[List[int]] = None,
-    plot_bbox: Optional[List[float]] = None,
-    speed_vmin: Optional[float] = None,
-    speed_vmax: Optional[float] = None,
-    pres_vmin: Optional[float] = None,
-    pres_vmax: Optional[float] = None,
+    plot_domain: list[int] | None = None,
+    plot_bbox: list[float] | None = None,
+    speed_vmin: float | None = None,
+    speed_vmax: float | None = None,
+    pres_vmin: float | None = None,
+    pres_vmax: float | None = None,
 ) -> None:
     if not show:
         import matplotlib
+
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -416,7 +450,9 @@ def quicklook_plot(
             spd = np.ma.masked_invalid(spd)
 
             if spd.mask.all():
-                raise ValueError("Wind speed field is all-NaN/masked in requested plot region/time.")
+                raise ValueError(
+                    "Wind speed field is all-NaN/masked in requested plot region/time."
+                )
             if p.mask.all():
                 raise ValueError("Pressure field is all-NaN/masked in requested plot region/time.")
 
@@ -441,14 +477,18 @@ def quicklook_plot(
                 spd = np.sqrt(u * u + v * v)
                 spd = np.ma.masked_invalid(spd)
                 if spd.mask.all():
-                    raise ValueError("Wind speed field is all-NaN/masked in requested plot region/time.")
+                    raise ValueError(
+                        "Wind speed field is all-NaN/masked in requested plot region/time."
+                    )
                 m = ax.pcolormesh(xs, ys, spd, shading="auto", vmin=speed_vmin, vmax=speed_vmax)
                 fig.colorbar(m, ax=ax).set_label("Wind speed (m/s)")
                 ax.set_title(f"Wind speed ({timestr})")
 
             elif kind == "pressure":
                 if p.mask.all():
-                    raise ValueError("Pressure field is all-NaN/masked in requested plot region/time.")
+                    raise ValueError(
+                        "Pressure field is all-NaN/masked in requested plot region/time."
+                    )
                 m = ax.pcolormesh(xs, ys, p, shading="auto", vmin=pres_vmin, vmax=pres_vmax)
                 fig.colorbar(m, ax=ax).set_label("Pressure (Pa)")
                 ax.set_title(f"Pressure ({timestr})")
@@ -457,7 +497,9 @@ def quicklook_plot(
                 spd = np.sqrt(u * u + v * v)
                 spd = np.ma.masked_invalid(spd)
                 if spd.mask.all():
-                    raise ValueError("Wind speed field is all-NaN/masked in requested plot region/time.")
+                    raise ValueError(
+                        "Wind speed field is all-NaN/masked in requested plot region/time."
+                    )
                 m = ax.pcolormesh(xs, ys, spd, shading="auto", vmin=speed_vmin, vmax=speed_vmax)
                 fig.colorbar(m, ax=ax).set_label("Wind speed (m/s)")
 
@@ -500,12 +542,12 @@ def _compute_movie_limits(
     kind: str,
     every: int,
     plot_step: int,
-    plot_domain: Optional[List[int]],
-    plot_bbox: Optional[List[float]],
+    plot_domain: list[int] | None,
+    plot_bbox: list[float] | None,
     scale_mode: str,
     pmin: float,
     pmax: float,
-) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+) -> tuple[float | None, float | None, float | None, float | None]:
     if every < 1:
         raise ValueError("--movie-every must be >= 1")
     if plot_step < 1:
@@ -546,18 +588,18 @@ def _compute_movie_limits(
                         p_min = min(p_min, float(np.nanmin(pp)))
                         p_max = max(p_max, float(np.nanmax(pp)))
 
-        speed_vmin = (spd_min if need_speed and spd_min != math.inf else None)
-        speed_vmax = (spd_max if need_speed and spd_max != -math.inf else None)
-        pres_vmin = (p_min if need_pres and p_min != math.inf else None)
-        pres_vmax = (p_max if need_pres and p_max != -math.inf else None)
+        speed_vmin = spd_min if need_speed and spd_min != math.inf else None
+        speed_vmax = spd_max if need_speed and spd_max != -math.inf else None
+        pres_vmin = p_min if need_pres and p_min != math.inf else None
+        pres_vmax = p_max if need_pres and p_max != -math.inf else None
         return speed_vmin, speed_vmax, pres_vmin, pres_vmax
 
     if scale_mode == "percentile":
         if not (0.0 <= pmin < pmax <= 100.0):
             raise ValueError("--movie-pmin/--movie-pmax must satisfy 0 <= pmin < pmax <= 100")
 
-        speed_samples: List[np.ndarray] = []
-        pres_samples: List[np.ndarray] = []
+        speed_samples: list[np.ndarray] = []
+        pres_samples: list[np.ndarray] = []
 
         with Dataset(nc_path) as nc:
             U = nc.variables["U"]
@@ -603,13 +645,13 @@ def make_movie(
     kind: str,
     fps: int,
     every: int,
-    out_mp4: Optional[str],
+    out_mp4: str | None,
     ffmpeg_exe: str,
     keep_frames: bool,
     verbose: bool,
     plot_step: int = 1,
-    plot_domain: Optional[List[int]] = None,
-    plot_bbox: Optional[List[float]] = None,
+    plot_domain: list[int] | None = None,
+    plot_bbox: list[float] | None = None,
     fixed_scale: bool = True,
     scale_mode: str = "minmax",
     pmin: float = 1.0,
@@ -662,7 +704,7 @@ def make_movie(
     frame_idx = 0
     for t in range(0, nt, every):
         if (frame_idx % 10 == 0) or (t == 0) or (t + every >= nt):
-            print(f"Rendering frame {frame_idx+1} / {((nt-1)//every)+1} (t={t})")
+            print(f"Rendering frame {frame_idx + 1} / {((nt - 1) // every) + 1} (t={t})")
 
         frame_file = tmpdir / f"frame_{frame_idx:06d}.png"
         quicklook_plot(
@@ -733,7 +775,7 @@ def _interplevel_with_optional_fallback(
     dz: float,
     verbose: bool,
     label: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]:
     """
     Returns (ua_z, va_z, p_z, z_used, used_fallback)
     """
@@ -762,7 +804,9 @@ def _interplevel_with_optional_fallback(
     zmin = float(np.nanmin(np.asarray(z_field)))
     z_fallback = zmin + dz
     if verbose:
-        print(f"[{label}] interplevel all-NaN at z={z_target:.2f}; falling back to z={z_fallback:.2f} (zmin+dz)")
+        print(
+            f"[{label}] interplevel all-NaN at z={z_target:.2f}; falling back to z={z_fallback:.2f} (zmin+dz)"
+        )
 
     ua_z2 = _interplevel_timewise(ua, z_field, z_fallback)
     va_z2 = _interplevel_timewise(va, z_field, z_fallback)
@@ -775,7 +819,8 @@ def _interplevel_with_optional_fallback(
 
     return np.asarray(ua_z2), np.asarray(va_z2), np.asarray(p_z2), float(z_fallback), True
 
-def _expand_inputs(inputs: List[str], verbose: bool = False) -> List[str]:
+
+def _expand_inputs(inputs: list[str], verbose: bool = False) -> list[str]:
     """Expand user inputs (files/dirs/globs) into a sorted list of NetCDF files.
 
     Rules:
@@ -788,7 +833,7 @@ def _expand_inputs(inputs: List[str], verbose: bool = False) -> List[str]:
     import glob
     import os
 
-    expanded: List[str] = []
+    expanded: list[str] = []
     for item in inputs:
         item = os.path.expanduser(os.path.expandvars(item))
         if any(ch in item for ch in ["*", "?", "["]):
@@ -800,7 +845,7 @@ def _expand_inputs(inputs: List[str], verbose: bool = False) -> List[str]:
 
     # De-duplicate while preserving order
     seen = set()
-    out: List[str] = []
+    out: list[str] = []
     for f in expanded:
         if f not in seen:
             seen.add(f)
@@ -810,7 +855,9 @@ def _expand_inputs(inputs: List[str], verbose: bool = False) -> List[str]:
         print(f"[inputs] expanded to {len(out)} files")
 
     if len(out) == 0:
-        raise FileNotFoundError("No input NetCDF files found from provided paths/globs/directories.")
+        raise FileNotFoundError(
+            "No input NetCDF files found from provided paths/globs/directories."
+        )
 
     return out
 
@@ -820,7 +867,7 @@ def _expand_inputs(inputs: List[str], verbose: bool = False) -> List[str]:
 # -----------------------------
 def main() -> None:
     args = parse_args()
-    files: List[str] = _expand_inputs(args.files, verbose=args.verbose)
+    files: list[str] = _expand_inputs(args.files, verbose=args.verbose)
     out_path: str = args.output
 
     output_exists = os.path.exists(out_path)
@@ -855,9 +902,15 @@ def main() -> None:
             comp = dict(zlib=(args.compression > 0), complevel=args.compression)
             chunks = (1, sn, we)
 
-            v_u = out_nc.createVariable("U", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp)
-            v_v = out_nc.createVariable("V", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp)
-            v_p = out_nc.createVariable("P", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp)
+            v_u = out_nc.createVariable(
+                "U", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp
+            )
+            v_v = out_nc.createVariable(
+                "V", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp
+            )
+            v_p = out_nc.createVariable(
+                "P", "f4", ("Time", "south_north", "west_east"), chunksizes=chunks, **comp
+            )
 
             v_u.units = "m s-1"
             v_v.units = "m s-1"
@@ -905,7 +958,11 @@ def main() -> None:
                     if args.z_ref == "agl":
                         if "HGT" not in nc.variables:
                             raise KeyError("Requested --z-ref agl but HGT is missing in file.")
-                        hgt = nc.variables["HGT"][0, :, :] if nc.variables["HGT"].ndim == 3 else nc.variables["HGT"][:, :]
+                        hgt = (
+                            nc.variables["HGT"][0, :, :]
+                            if nc.variables["HGT"].ndim == 3
+                            else nc.variables["HGT"][:, :]
+                        )
                         z_field = z_msl - hgt[None, None, :, :]
                     else:
                         z_field = z_msl
@@ -935,11 +992,11 @@ def main() -> None:
                         print(f"  NOTE: used fallback z={z_used:.2f} m for {os.path.basename(f)}")
 
                     # Write time + fields
-                    out_nc.variables["Times"][t_out:t_out + nt, :] = times
-                    out_nc.variables["XTIME"][t_out:t_out + nt] = xtime
-                    out_nc.variables["U"][t_out:t_out + nt, :, :] = np.asarray(ua_z, dtype="f4")
-                    out_nc.variables["V"][t_out:t_out + nt, :, :] = np.asarray(va_z, dtype="f4")
-                    out_nc.variables["P"][t_out:t_out + nt, :, :] = np.asarray(p_z, dtype="f4")
+                    out_nc.variables["Times"][t_out : t_out + nt, :] = times
+                    out_nc.variables["XTIME"][t_out : t_out + nt] = xtime
+                    out_nc.variables["U"][t_out : t_out + nt, :, :] = np.asarray(ua_z, dtype="f4")
+                    out_nc.variables["V"][t_out : t_out + nt, :, :] = np.asarray(va_z, dtype="f4")
+                    out_nc.variables["P"][t_out : t_out + nt, :, :] = np.asarray(p_z, dtype="f4")
 
                     t_out += nt
 

@@ -10,6 +10,7 @@ In practice:
 Each subcommand simply delegates to the corresponding top-level script in the
 repository checkout. This avoids import-time dependency issues across envs.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,14 +38,22 @@ def _run_script(script: Path, argv: list[str]) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="alaska-extract", description="Alaska WRF extract/regrid utilities")
+    p = argparse.ArgumentParser(
+        prog="alaska-extract", description="Alaska WRF extract/regrid utilities"
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_ex = sub.add_parser("extract", help="Extract U/V/P from WRF at a z-level")
-    p_ex.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed through to wrf_extract_uvp_at_z.py")
+    p_ex.add_argument(
+        "args", nargs=argparse.REMAINDER, help="Arguments passed through to wrf_extract_uvp_at_z.py"
+    )
 
     p_rg = sub.add_parser("regrid", help="Regrid extracted U/V/P to regular lat/lon (xESMF)")
-    p_rg.add_argument("args", nargs=argparse.REMAINDER, help="Arguments passed through to wrf_regrid_uvp_to_latlon.py")
+    p_rg.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to wrf_regrid_uvp_to_latlon.py",
+    )
 
     return p
 

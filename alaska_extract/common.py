@@ -5,14 +5,13 @@ This module is intentionally lightweight so it can be imported from both pixi
 environments (wrf and regrid). Avoid importing heavy optional deps at module import
 time (e.g., xesmf, wrf-python).
 """
+
 from __future__ import annotations
 
 import ast
-
 import os
 import shutil
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
 
 import numpy as np
 
@@ -31,7 +30,9 @@ def find_ffmpeg(ffmpeg: str = "ffmpeg") -> str:
     path = shutil.which(ffmpeg)
     if path:
         return path
-    raise RuntimeError(f"ffmpeg not found ('{ffmpeg}'). Install ffmpeg or pass --ffmpeg /path/to/ffmpeg")
+    raise RuntimeError(
+        f"ffmpeg not found ('{ffmpeg}'). Install ffmpeg or pass --ffmpeg /path/to/ffmpeg"
+    )
 
 
 def decode_wrf_times(value) -> str:
@@ -47,7 +48,7 @@ def decode_wrf_times(value) -> str:
     if isinstance(value, str):
         v = value.strip()
         # Some pipelines accidentally stringify bytes, yielding "b'...'"
-        if (v.startswith("b\'") and v.endswith("\'")) or (v.startswith('b"') and v.endswith('"')):
+        if (v.startswith("b'") and v.endswith("'")) or (v.startswith('b"') and v.endswith('"')):
             try:
                 b = ast.literal_eval(v)
                 if isinstance(b, (bytes, bytearray)):
@@ -93,7 +94,7 @@ def sanitize_netcdf_attrs(attrs: dict) -> dict:
     return out
 
 
-def lon_continuous_about(lon_deg: np.ndarray, center_deg: Optional[float] = None) -> np.ndarray:
+def lon_continuous_about(lon_deg: np.ndarray, center_deg: float | None = None) -> np.ndarray:
     """
     Shift longitudes into a continuous window around center_deg.
     Result is in [center-180, center+180), which may extend outside [-180, 180).
@@ -113,7 +114,7 @@ def infer_lon_center(lon_deg: np.ndarray) -> float:
     return float(np.nanmedian(lon180))
 
 
-def global_minmax(arr: np.ndarray, mask_nan: bool = True) -> Tuple[float, float]:
+def global_minmax(arr: np.ndarray, mask_nan: bool = True) -> tuple[float, float]:
     """Min/max ignoring NaNs by default."""
     a = np.asarray(arr, dtype=np.float64)
     if mask_nan:
@@ -121,7 +122,7 @@ def global_minmax(arr: np.ndarray, mask_nan: bool = True) -> Tuple[float, float]
     return float(a.min()), float(a.max())
 
 
-def percentile_range(arr: np.ndarray, pmin: float, pmax: float) -> Tuple[float, float]:
+def percentile_range(arr: np.ndarray, pmin: float, pmax: float) -> tuple[float, float]:
     a = np.asarray(arr, dtype=np.float64)
     a = a[np.isfinite(a)]
     if a.size == 0:

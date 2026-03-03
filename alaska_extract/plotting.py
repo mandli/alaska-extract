@@ -3,11 +3,11 @@
 This module deliberately imports matplotlib only inside functions so importing
 scripts remains light. ffmpeg discovery lives in alaska_extract.common.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -23,6 +23,7 @@ class FixedScale:
 def _mpl_setup(show: bool) -> None:
     if not show:
         import matplotlib
+
         matplotlib.use("Agg")
 
 
@@ -42,7 +43,9 @@ def decode_time_title(ds, t_index: int) -> str:
             return ""
 
 
-def compute_fixed_scale(arr: np.ndarray, mode: str = "percentile", pmin: float = 1.0, pmax: float = 99.0) -> FixedScale:
+def compute_fixed_scale(
+    arr: np.ndarray, mode: str = "percentile", pmin: float = 1.0, pmax: float = 99.0
+) -> FixedScale:
     a = np.asarray(arr, dtype=np.float64)
     a = a[np.isfinite(a)]
     if a.size == 0:
@@ -61,11 +64,11 @@ def plot_uvp_quicklook(
     *,
     title: str = "",
     kind: str = "both",
-    out_png: Optional[str] = None,
+    out_png: str | None = None,
     show: bool = False,
     fixed_scale: bool = False,
-    scale_speed: Optional[FixedScale] = None,
-    scale_pressure: Optional[FixedScale] = None,
+    scale_speed: FixedScale | None = None,
+    scale_pressure: FixedScale | None = None,
 ) -> None:
     """Quicklook plot for speed/pressure/quiver/both."""
     _mpl_setup(show)
@@ -148,18 +151,25 @@ def movie_from_frames(
 ) -> None:
     ff = find_ffmpeg(ffmpeg)
     cmd = [
-        ff, "-y",
-        "-framerate", str(int(fps)),
-        "-i", str(frames_dir / "frame_%05d.png"),
-        "-pix_fmt", "yuv420p",
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        ff,
+        "-y",
+        "-framerate",
+        str(int(fps)),
+        "-i",
+        str(frames_dir / "frame_%05d.png"),
+        "-pix_fmt",
+        "yuv420p",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         str(out_mp4),
     ]
     vprint(verbose, "[movie] ffmpeg:", " ".join(cmd))
     import subprocess
+
     subprocess.run(cmd, check=True)
     print(f"Wrote movie: {out_mp4}")
     if not keep_frames:
         import shutil
+
         shutil.rmtree(frames_dir, ignore_errors=True)
         vprint(verbose, f"[movie] Removed frames_dir={frames_dir}")
