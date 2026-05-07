@@ -95,6 +95,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument(
+        "--psfc",
+        action="store_true",
+        default=False,
+        help="Use PSFC (surface pressure) directly for P instead of interpolating 3D pressure "
+        "to the target z-level. Recommended when the goal is storm surge (GeoClaw) forcing, "
+        "where surface/sea-level pressure is required. PSFC must be present in each input file.",
+    )
+
+    p.add_argument(
         "--compression", type=int, default=4, help="NetCDF deflate level (0-9). Default: 4."
     )
     p.add_argument(
@@ -203,11 +212,51 @@ def parse_args() -> argparse.Namespace:
 # -----------------------------
 # Helpers
 # -----------------------------
+def _detect_spatial_dims(nc: Dataset) -> tuple[str, str]:
+    """Return (sn_dim, we_dim) — the spatial dimension names for this file.
+
+    Inspects XLAT/XLONG variable dimensions first (correct even when the file uses
+    non-standard names like 'y'/'x'), then falls back to the canonical WRF names
+    'south_north'/'west_east'.
+
+    Raises KeyError with a diagnostic message if the file contains neither XLAT/XLONG
+    nor standard WRF dimension names — distinguishing "unexpected dim names" from
+    "not a WRF file at all".
+    """
+    for geo_var in ("XLAT", "XLONG"):
+        if geo_var in nc.variables:
+            d = nc.variables[geo_var].dimensions
+            if len(d) == 3:  # (Time, sn, we)
+                return d[1], d[2]
+            if len(d) == 2:  # (sn, we) — static, no Time dim
+                return d[0], d[1]
+
+    dims = set(nc.dimensions)
+    if "south_north" in dims and "west_east" in dims:
+        return "south_north", "west_east"
+
+    try:
+        filepath = nc.filepath()
+    except Exception:
+        filepath = "<unknown>"
+    raise KeyError(
+        f"Cannot identify WRF spatial dimensions in {filepath!r}.\n"
+        f"  Available dimensions: {sorted(dims)}\n"
+        "  Expected XLAT or XLONG variables (to infer dimension names from), or\n"
+        "  standard WRF dimension names 'south_north'/'west_east'.\n"
+        "  This file may be a non-standard WRF output stream (h01/h02/etc.) that\n"
+        "  was post-processed with NCO/CDO, or it may not be a WRF-derived file."
+    )
+
+
 def _ensure_same_hgrid(nc: Dataset, sn: int, we: int) -> None:
-    if nc.dimensions["south_north"].size != sn or nc.dimensions["west_east"].size != we:
+    sn_dim, we_dim = _detect_spatial_dims(nc)
+    actual_sn = nc.dimensions[sn_dim].size
+    actual_we = nc.dimensions[we_dim].size
+    if actual_sn != sn or actual_we != we:
         raise ValueError(
-            f"Horizontal grid mismatch: expected (south_north={sn}, west_east={we}) "
-            f"got ({nc.dimensions['south_north'].size}, {nc.dimensions['west_east'].size})"
+            f"Horizontal grid mismatch: expected ({sn_dim}={sn}, {we_dim}={we}) "
+            f"got ({actual_sn}, {actual_we})"
         )
 
 
@@ -884,8 +933,9 @@ def main() -> None:
     if do_extract:
         # Define grid from first file
         with Dataset(files[0]) as nc0:
-            sn = nc0.dimensions["south_north"].size
-            we = nc0.dimensions["west_east"].size
+            sn_dim, we_dim = _detect_spatial_dims(nc0)
+            sn = nc0.dimensions[sn_dim].size
+            we = nc0.dimensions[we_dim].size
             datestrlen = nc0.dimensions["DateStrLen"].size if "DateStrLen" in nc0.dimensions else 19
             static = _get_static_fields(nc0)
 
@@ -922,6 +972,7 @@ def main() -> None:
             out_nc.setncattr("wrf_extract_z_auto", int(bool(args.z_auto)))
             out_nc.setncattr("wrf_extract_z_auto_dz_m", float(args.z_auto_dz))
             out_nc.setncattr("wrf_extract_z_fallback_enabled", int(not args.no_z_fallback))
+            out_nc.setncattr("wrf_extract_use_psfc", int(bool(args.psfc)))
             out_nc.setncattr("source_files", " ".join(files))
 
             if args.keep_geo:
@@ -948,11 +999,9 @@ def main() -> None:
                     xtime = nc.variables["XTIME"][:].astype("f4")
                     nt = times.shape[0]
 
-                    # WRF-aware vars
-                    ua = getvar(nc, "ua", timeidx=ALL_TIMES)  # m/s
+                    # WRF-aware wind interpolation
+                    ua = getvar(nc, "ua", timeidx=ALL_TIMES)  # m/s, mass-grid destaggered
                     va = getvar(nc, "va", timeidx=ALL_TIMES)  # m/s
-                    pres_hpa = getvar(nc, "pressure", timeidx=ALL_TIMES)  # hPa
-                    pres_pa = pres_hpa * 100.0
                     z_msl = getvar(nc, "z", timeidx=ALL_TIMES)  # m MSL (mass grid)
 
                     if args.z_ref == "agl":
@@ -975,21 +1024,53 @@ def main() -> None:
                         dz=float(args.z_auto_dz),
                     )
 
-                    # Interpolate with optional fallback if all-NaN
-                    ua_z, va_z, p_z, z_used, used_fallback = _interplevel_with_optional_fallback(
-                        ua=ua,
-                        va=va,
-                        pres_pa=pres_pa,
-                        z_field=z_field,
-                        z_target=z_req,
-                        allow_fallback=(not args.no_z_fallback) and (not args.z_auto),
-                        dz=float(args.z_auto_dz),
-                        verbose=bool(args.verbose),
-                        label=os.path.basename(f),
-                    )
+                    if args.psfc:
+                        # Use PSFC (surface pressure) directly — preferred for storm surge forcing.
+                        # Avoids unnecessary vertical interpolation; PSFC is what GeoClaw needs.
+                        if "PSFC" not in nc.variables:
+                            raise KeyError(
+                                f"--psfc requested but PSFC is not in {os.path.basename(f)}. "
+                                "Remove --psfc to fall back to interpolated pressure."
+                            )
+                        p_z = nc.variables["PSFC"][:, :, :].astype("f4")  # (Time, sn, we) Pa
+                        # Wind still interpolated to requested z-level
+                        ua_z, va_z, _, z_used, used_fallback = _interplevel_with_optional_fallback(
+                            ua=ua,
+                            va=va,
+                            pres_pa=np.ones_like(np.asarray(ua)),  # dummy — pressure unused here
+                            z_field=z_field,
+                            z_target=z_req,
+                            allow_fallback=(not args.no_z_fallback) and (not args.z_auto),
+                            dz=float(args.z_auto_dz),
+                            verbose=bool(args.verbose),
+                            label=os.path.basename(f),
+                        )
+                        if used_fallback:
+                            print(
+                                f"  NOTE: used fallback z={z_used:.2f} m (wind) for {os.path.basename(f)}"
+                            )
+                    else:
+                        pres_hpa = getvar(nc, "pressure", timeidx=ALL_TIMES)  # hPa
+                        pres_pa = pres_hpa * 100.0
 
-                    if used_fallback:
-                        print(f"  NOTE: used fallback z={z_used:.2f} m for {os.path.basename(f)}")
+                        # Interpolate all three fields with optional fallback if all-NaN
+                        ua_z, va_z, p_z, z_used, used_fallback = (
+                            _interplevel_with_optional_fallback(
+                                ua=ua,
+                                va=va,
+                                pres_pa=pres_pa,
+                                z_field=z_field,
+                                z_target=z_req,
+                                allow_fallback=(not args.no_z_fallback) and (not args.z_auto),
+                                dz=float(args.z_auto_dz),
+                                verbose=bool(args.verbose),
+                                label=os.path.basename(f),
+                            )
+                        )
+                        if used_fallback:
+                            print(
+                                f"  NOTE: used fallback z={z_used:.2f} m for {os.path.basename(f)}"
+                            )
 
                     # Write time + fields
                     out_nc.variables["Times"][t_out : t_out + nt, :] = times
@@ -1000,10 +1081,15 @@ def main() -> None:
 
                     t_out += nt
 
-            # Update long_name after the fact (since effective z may vary by file)
+            # Update long_name after the fact (effective z may vary by file)
             v_u.long_name = f"U wind interpolated to z (see attributes; requested z={float(args.z)} m, ref={args.z_ref})"
             v_v.long_name = f"V wind interpolated to z (see attributes; requested z={float(args.z)} m, ref={args.z_ref})"
-            v_p.long_name = f"Pressure interpolated to z (see attributes; requested z={float(args.z)} m, ref={args.z_ref})"
+            if args.psfc:
+                v_p.long_name = "Surface pressure (PSFC from WRF)"
+                out_nc.setncattr("wrf_extract_pressure_source", "PSFC")
+            else:
+                v_p.long_name = f"Pressure interpolated to z (see attributes; requested z={float(args.z)} m, ref={args.z_ref})"
+                out_nc.setncattr("wrf_extract_pressure_source", "interplevel")
 
             out_nc.sync()
 
