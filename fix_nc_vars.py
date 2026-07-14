@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 
 import sys
-from pathlib import Path
+
 import netCDF4 as nc
 import numpy as np
+
 
 def fix_time(ds: nc.Dataset):
     # Parse Times char array -> seconds since reference
