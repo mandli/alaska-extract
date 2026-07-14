@@ -4,7 +4,9 @@ Two small command-line tools for working with WRF outputs:
 
 1. `wrf_extract_uvp_at_z.py` (pixi env: `wrf`)
    - Takes WRF NetCDF files (files/dirs/globs)
-   - Extracts **U/V (m s-1)** and **pressure (Pa)** at a target geometric height
+   - Extracts **U/V (m s-1)** at a target geometric height, plus **pressure (Pa)**
+     as sea-level pressure (`--slp`), surface pressure (`--psfc`), or 3D pressure
+     interpolated to the target height (default)
    - Concatenates across Time into a compact NetCDF
    - Optional quicklook plots + movie
 
@@ -29,10 +31,26 @@ pixi run -e regrid check-esmf
 pixi run -e wrf extract -- \
   /path/to/h01_files/*.nc \
   -o uvp.nc --keep-geo --verbose \
-  --z 10 --z-ref agl
+  --slp --z 10 --z-ref agl
 ```
 
 > If `--` gives you trouble in zsh, remove it; it’s only needed if your task definition includes it.
+
+### Pressure source
+
+Choose how `P` is produced:
+
+- `--slp` — **sea-level pressure** via wrf-python's hydrostatic reduction.
+  **Use this for storm-surge (GeoClaw) forcing.** It yields a physically
+  consistent ~95–105 kPa field everywhere, including over high terrain.
+- `--psfc` — surface pressure at terrain elevation. **Not** sea-level pressure:
+  over high terrain it is the true air pressure at altitude (e.g. ~50 kPa on
+  Denali), which trips GeoClaw's pressure range check and is not a valid surge
+  forcing field over mountainous domains.
+- *(neither flag)* — 3D pressure interpolated to the target z-level.
+
+`--slp` and `--psfc` are mutually exclusive. The chosen source is recorded in
+the output as the `wrf_extract_pressure_source` global attribute.
 
 ## Regrid
 

@@ -98,9 +98,20 @@ def parse_args() -> argparse.Namespace:
         "--psfc",
         action="store_true",
         default=False,
-        help="Use PSFC (surface pressure) directly for P instead of interpolating 3D pressure "
-        "to the target z-level. Recommended when the goal is storm surge (GeoClaw) forcing, "
-        "where surface/sea-level pressure is required. PSFC must be present in each input file.",
+        help="Use PSFC (surface pressure at terrain elevation) directly for P instead of "
+        "interpolating 3D pressure to the target z-level. NOT sea-level pressure -- over high "
+        "terrain PSFC is the true air pressure at altitude (e.g. ~50 kPa on Denali). For storm "
+        "surge (GeoClaw) forcing use --slp instead. PSFC must be present in each input file.",
+    )
+
+    p.add_argument(
+        "--slp",
+        action="store_true",
+        default=False,
+        help="Use sea-level pressure (SLP) for P via wrf-python's built-in hydrostatic "
+        "reduction. Recommended for storm surge (GeoClaw) forcing: gives a physically "
+        "consistent ~95-105 kPa field everywhere, including over high terrain. Mutually "
+        "exclusive with --psfc.",
     )
 
     p.add_argument(
@@ -206,7 +217,10 @@ def parse_args() -> argparse.Namespace:
         help="Upper percentile for percentile scaling. Default: 99.",
     )
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.psfc and args.slp:
+        p.error("--psfc and --slp are mutually exclusive; choose one pressure source.")
+    return args
 
 
 # -----------------------------
@@ -973,6 +987,7 @@ def main() -> None:
             out_nc.setncattr("wrf_extract_z_auto_dz_m", float(args.z_auto_dz))
             out_nc.setncattr("wrf_extract_z_fallback_enabled", int(not args.no_z_fallback))
             out_nc.setncattr("wrf_extract_use_psfc", int(bool(args.psfc)))
+            out_nc.setncattr("wrf_extract_use_slp", int(bool(args.slp)))
             out_nc.setncattr("source_files", " ".join(files))
 
             if args.keep_geo:
@@ -1049,6 +1064,29 @@ def main() -> None:
                             print(
                                 f"  NOTE: used fallback z={z_used:.2f} m (wind) for {os.path.basename(f)}"
                             )
+                    elif args.slp:
+                        # Sea-level pressure via wrf-python's hydrostatic reduction — the
+                        # physically consistent forcing field for storm surge (GeoClaw).
+                        # Unlike PSFC, this is ~95-105 kPa everywhere, including over high
+                        # terrain, so it does not inject spurious pressure lows over mountains.
+                        slp_hpa = getvar(nc, "slp", timeidx=ALL_TIMES)  # hPa, (Time, sn, we)
+                        p_z = np.asarray(slp_hpa, dtype="f4") * 100.0  # -> Pa
+                        # Wind still interpolated to requested z-level (same as --psfc).
+                        ua_z, va_z, _, z_used, used_fallback = _interplevel_with_optional_fallback(
+                            ua=ua,
+                            va=va,
+                            pres_pa=np.ones_like(np.asarray(ua)),  # dummy — pressure unused here
+                            z_field=z_field,
+                            z_target=z_req,
+                            allow_fallback=(not args.no_z_fallback) and (not args.z_auto),
+                            dz=float(args.z_auto_dz),
+                            verbose=bool(args.verbose),
+                            label=os.path.basename(f),
+                        )
+                        if used_fallback:
+                            print(
+                                f"  NOTE: used fallback z={z_used:.2f} m (wind) for {os.path.basename(f)}"
+                            )
                     else:
                         pres_hpa = getvar(nc, "pressure", timeidx=ALL_TIMES)  # hPa
                         pres_pa = pres_hpa * 100.0
@@ -1087,6 +1125,9 @@ def main() -> None:
             if args.psfc:
                 v_p.long_name = "Surface pressure (PSFC from WRF)"
                 out_nc.setncattr("wrf_extract_pressure_source", "PSFC")
+            elif args.slp:
+                v_p.long_name = "Sea-level pressure (SLP, hydrostatic reduction via wrf.slp)"
+                out_nc.setncattr("wrf_extract_pressure_source", "SLP")
             else:
                 v_p.long_name = f"Pressure interpolated to z (see attributes; requested z={float(args.z)} m, ref={args.z_ref})"
                 out_nc.setncattr("wrf_extract_pressure_source", "interplevel")
