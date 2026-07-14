@@ -27,6 +27,7 @@ def fix_time(ds: nc.Dataset):
     tvar.standard_name = "time"
     tvar.axis = "T"
 
+
 def fix_latlon(ds: nc.Dataset):
     # Do some other name fixups for lat/lon
     ds.variables["lon"].standard_name = "longitude"
@@ -36,14 +37,16 @@ def fix_latlon(ds: nc.Dataset):
     ds.variables["lat"].units = "degrees_north"
     ds.variables["lat"].axis = "Y"
 
+
 def check_pressure(ds: nc.Dataset):
-    print(ds.variables["P"].units)       # should be "Pa"
-    print(ds.variables["P"][:].mean())   # sanity check: ~1e5
+    print(ds.variables["P"].units)  # should be "Pa"
+    print(ds.variables["P"][:].mean())  # sanity check: ~1e5
+
 
 def main():
     if sys.argv[1:]:
         path = sys.argv[1]
-    else:        
+    else:
         path = "uvp_latlon.nc"
 
     with nc.Dataset(path, "r+") as ds:
